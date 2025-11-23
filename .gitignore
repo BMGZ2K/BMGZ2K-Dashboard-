@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.factory/
+bot.log
+bot_clean.log
+error.log
+compile_error.log
+evolution.log
+debug_*.txt
+*.pkl

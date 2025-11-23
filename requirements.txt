@@ -1,0 +1,9 @@
+ccxt
+pandas
+python-dotenv
+ta
+streamlit
+plotly
+watchdog
+scikit-learn
+joblib
