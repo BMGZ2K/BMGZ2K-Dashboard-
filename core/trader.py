@@ -228,8 +228,10 @@ class Trader:
     def _check_entry(self, symbol: str, df: pd.DataFrame) -> Optional[Dict]:
         """Verificar sinal de entrada."""
         signal = self.signal_generator.generate_signal(df)
-        
-        if signal.direction == 'none' or signal.strength < 5:
+
+        # CORRIGIDO: Usar min_score_to_open do config em vez de hardcoded 5
+        min_strength = self.params.get('min_score_to_open', self.params.get('min_signal_strength', 5.0))
+        if signal.direction == 'none' or signal.strength < min_strength:
             return None
         
         quantity = self.calculate_position_size(signal.entry_price, signal.stop_loss)
@@ -308,37 +310,42 @@ class Trader:
         notional_exit = exit_price * pos.quantity
         commission = (notional_entry + notional_exit) * taker_fee
 
-        # Calcular funding pago durante a posição
+        # Calcular funding durante a posição
         # Funding é cobrado a cada 8h. Estimamos baseado no tempo da posição
+        # Convenção: POSITIVO = recebeu (ganho), NEGATIVO = pagou (custo)
         try:
             entry_time = datetime.fromisoformat(pos.entry_time)
             exit_time = datetime.now()
             hours_held = (exit_time - entry_time).total_seconds() / 3600
             funding_periods = hours_held / 8  # Número de períodos de funding
             # Funding = notional * rate * períodos
-            # Long paga quando rate positivo, short recebe
+            # Quando funding rate é positivo: long paga, short recebe
+            # Quando funding rate é negativo: long recebe, short paga
             avg_notional = (notional_entry + notional_exit) / 2
+            funding_amount = avg_notional * funding_rate * funding_periods
             if pos.side == 'long':
-                funding_cost = avg_notional * funding_rate * funding_periods
+                funding_cost = -funding_amount  # Long paga (negativo = custo)
             else:
-                funding_cost = -avg_notional * funding_rate * funding_periods  # Short recebe
+                funding_cost = funding_amount   # Short recebe (positivo = ganho)
         except Exception:
             funding_cost = 0
 
-        # PnL líquido = bruto - comissão - funding
-        net_pnl = pnl - commission - funding_cost
+        # NOTA: PnL principal é o BRUTO (sem descontar taxas)
+        # Taxas são registradas separadamente para análise
+        # O usuário quer ver o PnL real do trade, não descontado
 
-        log.debug(f"PnL {symbol}: bruto={pnl:.2f}, commission={commission:.2f}, funding={funding_cost:.2f}, net={net_pnl:.2f}")
-        
+        log.debug(f"PnL {symbol}: bruto={pnl:.2f}, commission={commission:.2f}, funding={funding_cost:.2f}")
+
         # Registrar trade com detalhes
+        # pnl = bruto (sem taxas), taxas são campos separados
         trade = Trade(
             symbol=symbol,
             side=pos.side,
             entry_price=pos.entry_price,
             exit_price=exit_price,
             quantity=pos.quantity,
-            pnl=net_pnl,
-            pnl_gross=pnl,
+            pnl=pnl,  # PnL BRUTO (sem descontar taxas)
+            pnl_gross=pnl,  # Mesmo valor, mantido para compatibilidade
             commission=commission,
             funding_cost=funding_cost,
             entry_time=pos.entry_time,
@@ -349,7 +356,7 @@ class Trader:
         )
         # Adicionar atributos extras
         trade.strategy = getattr(pos, 'strategy', self.params.get('strategy', 'unknown'))
-        trade.pnl_pct = (net_pnl / notional_entry) * 100 if notional_entry > 0 else 0
+        trade.pnl_pct = (pnl / notional_entry) * 100 if notional_entry > 0 else 0  # % do PnL bruto
         trade.order_id = getattr(pos, 'order_id', '')  # ID único da Binance
         self.trades.append(trade)
         
@@ -359,12 +366,14 @@ class Trader:
         
         # Remover posicao
         del self.positions[symbol]
-        
-        # Atualizar balance
-        self.balance += net_pnl
-        self.update_balance(self.balance)
-        
-        return net_pnl
+
+        # NOTA: NÃO atualizamos self.balance aqui porque:
+        # 1. O balance real vem da Binance via fetch_balance() no bot.py
+        # 2. Adicionar PnL aqui causaria contagem dupla
+        # 3. O balance será atualizado no próximo ciclo pelo run_cycle()
+        # Retornamos o PnL bruto para registro/logging
+
+        return pnl  # PnL bruto
     
     def get_stats(self) -> Dict:
         """Obter estatisticas."""
@@ -419,15 +428,58 @@ class Trader:
                     log.warning(f"Trade duplicado detectado (order_id={trade_order_id}), ignorando: {trade.symbol}")
                     return
 
-        # Fallback: verificar por symbol + entry_price + quantity (para trades sem order_id)
-        for existing in history[-50:]:
+        # CORRIGIDO: Verificar duplicatas de forma mais robusta
+        # O problema: quando bot reinicia, posições são sincronizadas com entry_time diferente
+        # mas quando fecham externamente, todas geram trades "duplicados"
+        # Solução: comparar por symbol + side + entry_price + quantity + exit_price
+        for existing in history[-100:]:  # Verificar últimos 100 trades
             is_same_symbol = existing.get('symbol') == trade.symbol
             is_same_side = existing.get('side') == trade.side
-            is_same_entry_price = abs(existing.get('entry_price', 0) - trade.entry_price) < 0.01
-            is_same_quantity = abs(existing.get('quantity', 0) - trade.quantity) < 0.0001
 
+            # Tolerância de 0.1% para preço de entrada
+            existing_entry = existing.get('entry_price', 0)
+            if existing_entry > 0:
+                price_diff_pct = abs(existing_entry - trade.entry_price) / existing_entry
+                is_same_entry_price = price_diff_pct < 0.001  # 0.1%
+            else:
+                is_same_entry_price = False
+
+            # Tolerância de 0.1% para preço de saída
+            existing_exit_price = existing.get('exit_price', 0)
+            if existing_exit_price > 0:
+                exit_price_diff_pct = abs(existing_exit_price - trade.exit_price) / existing_exit_price
+                is_same_exit_price = exit_price_diff_pct < 0.001  # 0.1%
+            else:
+                is_same_exit_price = False
+
+            # Tolerância de 1% para quantidade (cobre arredondamentos)
+            existing_qty = existing.get('quantity', 0)
+            if existing_qty > 0:
+                qty_diff_pct = abs(existing_qty - trade.quantity) / existing_qty
+                is_same_quantity = qty_diff_pct < 0.01  # 1%
+            else:
+                is_same_quantity = False
+
+            # Verificar se exit_time é muito próximo (dentro de 5 minutos)
+            existing_exit = existing.get('exit_time', '')
+            is_recent_exit = False
+            if existing_exit and trade.exit_time:
+                try:
+                    existing_exit_dt = datetime.fromisoformat(existing_exit)
+                    trade_exit_dt = datetime.fromisoformat(trade.exit_time)
+                    time_diff = abs((trade_exit_dt - existing_exit_dt).total_seconds())
+                    is_recent_exit = time_diff < 300  # 5 minutos
+                except Exception:
+                    pass
+
+            # DUPLICATA: mesmo symbol/side/entry_price/quantity (ignora entry_time diferente)
             if is_same_symbol and is_same_side and is_same_entry_price and is_same_quantity:
-                log.warning(f"Trade duplicado detectado (price+qty), ignorando: {trade.symbol}")
+                log.warning(f"Trade duplicado detectado (price+qty match), ignorando: {trade.symbol}")
+                return
+
+            # DUPLICATA: mesmo symbol/side/exit_price/quantity com saída recente
+            if is_same_symbol and is_same_side and is_same_exit_price and is_same_quantity and is_recent_exit:
+                log.warning(f"Trade duplicado detectado (exit match + recent), ignorando: {trade.symbol}")
                 return
 
         # Adicionar novo trade

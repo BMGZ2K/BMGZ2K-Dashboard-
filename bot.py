@@ -127,6 +127,17 @@ class TradingBot:
                     # Isso evita duplicatas ao sincronizar
                     position_id = f"{raw_sym}_{entry}_{abs(position_amt)}"
 
+                    # CORRIGIDO: Tentar usar updateTime da Binance para entry_time mais preciso
+                    # Isso melhora cálculo de funding e evita duplicatas
+                    update_time_ms = p.get('updateTime', 0)
+                    if update_time_ms:
+                        try:
+                            entry_time = datetime.fromtimestamp(update_time_ms / 1000).isoformat()
+                        except Exception:
+                            entry_time = datetime.now().isoformat()
+                    else:
+                        entry_time = datetime.now().isoformat()
+
                     # Adicionar ao estado local usando a dataclass Position
                     pos = Position(
                         symbol=sym,
@@ -135,7 +146,7 @@ class TradingBot:
                         quantity=abs(position_amt),
                         stop_loss=stop_loss,
                         take_profit=take_profit,
-                        entry_time=datetime.now().isoformat(),
+                        entry_time=entry_time,
                         max_price=entry,
                         min_price=entry,
                         reason_entry='Synced from Binance',

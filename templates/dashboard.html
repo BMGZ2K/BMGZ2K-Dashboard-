@@ -630,6 +630,14 @@
                         <span style="color: #9ca3af;">Aberto:</span>
                         <span id="unrealized-pnl" style="color: #3b82f6;">$0.00</span>
                     </div>
+                    <div style="display: flex; justify-content: space-between; margin-top: 4px; border-top: 1px solid #2d3748; padding-top: 4px;">
+                        <span style="color: #9ca3af;" title="Comissões de trading">Comissões:</span>
+                        <span id="total-commission" style="color: #ef4444;">$0.00</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between;">
+                        <span style="color: #9ca3af;" title="Taxas de funding (pode ser negativo se short)">Funding:</span>
+                        <span id="total-funding" style="color: #ef4444;">$0.00</span>
+                    </div>
                 </div>
             </div>
             
@@ -735,6 +743,7 @@
                             <th>Saida</th>
                             <th>Qtd</th>
                             <th>PnL</th>
+                            <th title="C=Comissão, F=Funding (negativo=recebido)">Taxas</th>
                             <th>%</th>
                             <th>Razao Entrada</th>
                             <th>Razao Saida</th>
@@ -785,19 +794,23 @@
     
     <script>
         // ===== CONFIGURAÇÃO DE INTERVALOS DE ATUALIZAÇÃO =====
-        // Tiered updates para melhor performance
-        const FAST_INTERVAL = 3000;    // Status, Posições (3s)
-        const MEDIUM_INTERVAL = 8000;  // Trades (8s)
-        const SLOW_INTERVAL = 15000;   // Estratégias, Logs (15s)
+        // UNIFICADO: Todos os dados de mercado atualizam juntos
+        const UNIFIED_INTERVAL = 1000;  // 1s - Status, Posições, Métricas (dados sincronizados)
+        const TRADES_INTERVAL = 3000;   // 3s - Trades (histórico)
+        const SLOW_INTERVAL = 10000;    // 10s - Estratégias, Logs
+
+        // Aliases para compatibilidade
+        const FAST_INTERVAL = UNIFIED_INTERVAL;
+        const MEDIUM_INTERVAL = TRADES_INTERVAL;
 
         // Timestamp da última atualização bem-sucedida
         let lastSuccessfulUpdate = Date.now();
-        const STALE_THRESHOLD_MS = 20000; // 20 segundos
+        const STALE_THRESHOLD_MS = 5000; // 5 segundos
 
-        // Cache local para evitar chamadas duplicadas
+        // Cache local desabilitado - backend já tem cache de 2s
         let statusDataCache = null;
         let statusCacheTime = 0;
-        const STATUS_CACHE_TTL = 2000; // 2s cache local
+        const STATUS_CACHE_TTL = 0; // Sem cache local, usar sempre do backend
 
         // ===== FUNÇÕES DE FORMATAÇÃO =====
         function formatCurrency(value) {
@@ -1045,6 +1058,18 @@
             unrealizedEl.textContent = formatCurrency(data.unrealized_pnl || 0);
             unrealizedEl.style.color = (data.unrealized_pnl || 0) >= 0 ? '#3b82f6' : '#ef4444';
             
+            // Taxas Detalhadas
+            // Convenção: POSITIVO = recebeu (ganho/verde), NEGATIVO = pagou (custo/vermelho)
+            const commissionEl = document.getElementById('total-commission');
+            const totalCommission = data.total_commission || 0;
+            commissionEl.textContent = '-' + formatCurrency(totalCommission);  // Sempre negativo (é custo)
+            commissionEl.style.color = '#ef4444';
+
+            const fundingEl = document.getElementById('total-funding');
+            const totalFunding = data.total_funding || 0;
+            fundingEl.textContent = (totalFunding >= 0 ? '+' : '') + formatCurrency(totalFunding);
+            fundingEl.style.color = totalFunding >= 0 ? '#10b981' : '#ef4444';
+
             // Margem Disponível
             document.getElementById('available-margin').textContent = formatCurrency(data.available_balance || 0);
             document.getElementById('used-margin').textContent = formatCurrency(data.initial_margin || 0);
@@ -1428,6 +1453,10 @@
                 const qty = parseFloat(t.quantity);
                 const qtyFormatted = qty >= 1000 ? qty.toLocaleString('en-US', {maximumFractionDigits: 2}) :
                                      qty >= 1 ? qty.toFixed(4) : qty.toPrecision(4);
+                const commission = t.commission || 0;
+                const funding = t.funding_cost || 0;
+                // Convenção: POSITIVO = recebeu (verde), NEGATIVO = pagou (vermelho)
+                const fundingColor = funding >= 0 ? '#10b981' : '#ef4444';
 
                 return `
                     <tr>
@@ -1439,6 +1468,10 @@
                         <td>${formatPrice(t.exit_price)}</td>
                         <td>${qtyFormatted}</td>
                         <td style="color: ${pnlColor}; font-weight: 600;">${formatCurrency(t.pnl)}</td>
+                        <td style="font-size: 11px;">
+                            <div style="color: #ef4444;">C: -${formatCurrency(commission)}</div>
+                            <div style="color: ${fundingColor};">F: ${funding >= 0 ? '+' : ''}${formatCurrency(funding)}</div>
+                        </td>
                         <td style="color: ${pnlColor};">${(t.pnl_pct || 0).toFixed(2)}%</td>
                         <td style="font-size: 11px; max-width: 150px; overflow: hidden; text-overflow: ellipsis;">${t.reason_entry || '-'}</td>
                         <td style="font-size: 11px;">${t.reason_exit || '-'}</td>
@@ -1471,16 +1504,27 @@
         }
         
         // ===== FUNÇÕES DE ATUALIZAÇÃO AGRUPADAS =====
-        async function updateFast() {
-            // Status/Métricas (mesma chamada com cache) e Posições
-            // Status e Metrics usam fetchStatus() que tem cache local
-            await updateStatus();
-            await updateMetrics();
-            await updatePositions();
+        async function updateUnified() {
+            // CRÍTICO: Status, Métricas e Posições DEVEM atualizar juntos
+            // Isso garante que os dados exibidos sejam consistentes
+            // O backend sincroniza account+tickers de uma vez, então aqui
+            // fazemos as 3 chamadas em paralelo (usam mesmo cache no backend)
+            try {
+                await Promise.all([
+                    updateStatus(),
+                    updateMetrics(),
+                    updatePositions()
+                ]);
+            } catch (e) {
+                console.error('Erro na atualização unificada:', e);
+            }
         }
 
+        // Alias para compatibilidade
+        const updateFast = updateUnified;
+
         async function updateMedium() {
-            // Trades (8s)
+            // Trades (histórico)
             await updateTrades();
         }
 
@@ -1493,8 +1537,8 @@
         }
 
         async function updateAll() {
-            // Carrega tudo sequencialmente para evitar sobrecarga inicial
-            await updateFast();
+            // Carrega tudo - unificado primeiro, depois o resto
+            await updateUnified();
             await updateMedium();
             await updateSlow();
         }
@@ -1503,10 +1547,13 @@
         // Carregar tudo inicialmente (com pequeno delay para dar tempo ao servidor)
         setTimeout(updateAll, 500);
 
-        // Intervalos diferentes para cada tipo de dado
-        setInterval(updateFast, FAST_INTERVAL);      // 3s - posições, status, métricas
-        setInterval(updateMedium, MEDIUM_INTERVAL);  // 8s - trades
-        setInterval(updateSlow, SLOW_INTERVAL);      // 15s - estratégias e logs
+        // Intervalos sincronizados:
+        // - Dados de mercado (status/posições/métricas): juntos a cada 1s
+        // - Trades: a cada 3s
+        // - Estratégias/logs: a cada 10s
+        setInterval(updateUnified, UNIFIED_INTERVAL);  // 1s - TUDO sincronizado
+        setInterval(updateMedium, TRADES_INTERVAL);    // 3s - trades
+        setInterval(updateSlow, SLOW_INTERVAL);        // 10s - estratégias e logs
 
         // Verificar dados desatualizados a cada 2s
         setInterval(checkDataStaleness, 2000);

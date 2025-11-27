@@ -34,12 +34,17 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config['TEMPLATES_AUTO_RELOAD'] = True
 
+# =============================================================================
+# CACHE UNIFICADO - Todos os dados sincronizados
+# =============================================================================
+# TTL padrão para todos os caches (garante consistência)
+UNIFIED_CACHE_TTL = 2.0  # 2 segundos
+
 # Cache de estado local (para evitar leituras repetidas de arquivo)
 _trader_state_cache = {
     'data': {},
     'timestamp': 0
 }
-CACHE_TTL = 2.0  # 2 segundos de TTL para o cache
 
 # Exchange connection cache
 _exchange_cache = {
@@ -48,21 +53,23 @@ _exchange_cache = {
 }
 EXCHANGE_CACHE_TTL = 60  # 60 segundos - conexão é estável
 
-# Cache de dados da Binance para evitar rate limits
+# Cache de dados da Binance - UNIFICADO para garantir consistência
+# Todos os endpoints usam os mesmos dados quando dentro do TTL
 _binance_data_cache = {
     'account': {'data': None, 'timestamp': 0},
     'tickers': {'data': None, 'timestamp': 0},
+    'last_sync': 0,  # Timestamp da última sincronização completa
 }
-BINANCE_CACHE_TTL = 2.0  # 2 segundos - dados de mercado
 
 
 def get_cached_account():
-    """Retorna dados da conta com cache de 2s."""
+    """Retorna dados da conta com cache."""
     global _binance_data_cache
     now = time.time()
     cache = _binance_data_cache['account']
 
-    if cache['data'] and (now - cache['timestamp']) < BINANCE_CACHE_TTL:
+    # Usar cache se ainda válido
+    if cache['data'] and (now - cache['timestamp']) < UNIFIED_CACHE_TTL:
         return cache['data']
 
     try:
@@ -70,6 +77,7 @@ def get_cached_account():
         account = exchange.fapiPrivateV2GetAccount()
         cache['data'] = account
         cache['timestamp'] = now
+        _binance_data_cache['last_sync'] = now
         return account
     except Exception as e:
         logger.error(f"Erro ao buscar conta: {e}")
@@ -77,23 +85,38 @@ def get_cached_account():
 
 
 def get_cached_tickers():
-    """Retorna tickers com cache de 2s."""
+    """
+    Retorna tickers/preços com cache.
+    Usa fapiPublicGetPremiumIndex que é muito mais rápido que fetch_tickers.
+    """
     global _binance_data_cache
     now = time.time()
     cache = _binance_data_cache['tickers']
 
-    if cache['data'] and (now - cache['timestamp']) < BINANCE_CACHE_TTL:
+    # Usar cache se ainda válido
+    if cache['data'] and (now - cache['timestamp']) < UNIFIED_CACHE_TTL:
         return cache['data']
 
     try:
         exchange = get_exchange()
-        tickers = exchange.fetch_tickers()
+
+        # Buscar mark prices (0.5s para todos os símbolos vs 8s+ para fetch_tickers)
+        mark_prices = exchange.fapiPublicGetPremiumIndex()
+        tickers = {}
+
+        for p in mark_prices:
+            raw_sym = p.get('symbol', '')
+            sym = raw_sym.replace('USDT', '/USDT')
+            mark_price = float(p.get('markPrice', 0) or 0)
+            if mark_price > 0:
+                tickers[sym] = {'last': mark_price, 'symbol': sym}
+
         cache['data'] = tickers
         cache['timestamp'] = now
         return tickers
     except Exception as e:
         logger.error(f"Erro ao buscar tickers: {e}")
-        return cache['data'] or {}  # Retorna cache antigo ou dict vazio
+        return cache['data'] or {}
 
 
 def get_exchange():
@@ -133,10 +156,10 @@ def get_exchange():
 
 
 def get_trader_state_cached():
-    """Retorna trader_state com cache de 500ms."""
+    """Retorna trader_state com cache unificado."""
     global _trader_state_cache
     now = time.time()
-    if now - _trader_state_cache['timestamp'] > CACHE_TTL:
+    if now - _trader_state_cache['timestamp'] > UNIFIED_CACHE_TTL:
         _trader_state_cache['data'] = load_json_safe('state/trader_state.json')
         _trader_state_cache['timestamp'] = now
     return _trader_state_cache['data']
@@ -189,6 +212,11 @@ def api_status():
             gross_profit = sum(t.get('pnl', 0) for t in trade_history if t.get('pnl', 0) > 0)
             gross_loss = abs(sum(t.get('pnl', 0) for t in trade_history if t.get('pnl', 0) < 0))
             profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else gross_profit
+            
+            # Calcular taxas totais (separadas)
+            total_commission = sum(t.get('commission', 0) for t in trade_history)
+            total_funding = sum(t.get('funding_cost', 0) for t in trade_history)
+            total_fees = total_commission + total_funding
         else:
             realized_pnl = 0
             total_trades = 0
@@ -196,6 +224,9 @@ def api_status():
             losses = 0
             win_rate = 0
             profit_factor = 0
+            total_fees = 0
+            total_commission = 0
+            total_funding = 0
         
         # Carregar estado local (com cache)
         trader = get_trader_state_cached()
@@ -211,8 +242,12 @@ def api_status():
         high_water_mark = max(margin_balance, initial_balance)
         drawdown_pct = ((high_water_mark - margin_balance) / high_water_mark * 100) if high_water_mark > 0 else 0
         
+        # Timestamp de sincronização do cache (quando os dados foram buscados da Binance)
+        sync_time = _binance_data_cache.get('last_sync', time.time())
+
         return jsonify({
             'timestamp': datetime.now().isoformat(),
+            'data_sync_time': datetime.fromtimestamp(sync_time).isoformat(),
             'mode': 'TESTNET' if USE_TESTNET else 'PRODUCTION',
             'timeframe': PRIMARY_TIMEFRAME,
             'symbols_count': len(SYMBOLS),
@@ -238,6 +273,10 @@ def api_status():
             'realized_pnl': round(realized_pnl, 2),
             'unrealized_pnl': round(unrealized_pnl, 2),
             'total_pnl': round(total_pnl, 2),
+            # Taxas detalhadas
+            'total_fees': round(total_fees, 2),
+            'total_commission': round(total_commission, 2),
+            'total_funding': round(total_funding, 2),
             'return_pct': round(return_pct, 2),
             'drawdown_pct': round(drawdown_pct, 2),
             'open_positions': len(open_positions),
@@ -333,10 +372,14 @@ def api_positions():
                 'entry_time': local.get('entry_time', ''),
             })
         
+        # Timestamp de sincronização (mesmo que /api/status)
+        sync_time = _binance_data_cache.get('last_sync', time.time())
+
         return jsonify({
             'count': len(positions),
             'total_unrealized_pnl': round(total_unrealized_pnl, 2),
-            'positions': positions
+            'positions': positions,
+            'data_sync_time': datetime.fromtimestamp(sync_time).isoformat(),
         })
     except Exception as e:
         return jsonify({
