@@ -5,17 +5,19 @@ Core Trading System
 Módulos principais do sistema de trading evolutivo.
 
 Módulos ativos:
-- config: Configurações (API keys, símbolos, parâmetros)
-- signals: Gerador de sinais de trading
+- config: Configurações centralizadas (API keys, símbolos, WFO_VALIDATED_PARAMS)
+- signals: Gerador de sinais de trading + classe Signal
+- strategies_optimized: Estratégias otimizadas (usa config centralizado)
+- trader: Execução de trades e gestão de posições
 - scoring: Sistema de pontuação de sinais
 - evolution: Storage de estratégias validadas
 - binance_fees: Taxas dinâmicas da Binance
-- indicators: Indicadores técnicos
+- utils: Utilitários (save_json_atomic, load_json_safe, etc.)
 - data: Busca de dados OHLCV
-- metrics: Métricas de performance
-- risk: Gerenciamento de risco
-- strategy: Engine de estratégias
-- trader: Execução de trades
+
+Módulos arquivados (não utilizados):
+- archive/deprecated_core/strategy.py
+- archive/deprecated_core/indicators.py
 """
 
 from .config import (

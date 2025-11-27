@@ -2,28 +2,18 @@
 Strategies Optimized Module
 Estratégias otimizadas baseadas em análise de performance real.
 
-v2.0: Parâmetros centralizados via core/config.py
+v2.1: Parâmetros centralizados via core/config.py
+      Signal importado de signals.py (sem duplicação)
 """
 import pandas as pd
 import numpy as np
 from typing import Dict, Tuple
-from dataclasses import dataclass
 
 # Import centralizado - FONTE ÚNICA DE VERDADE
 from .config import WFO_VALIDATED_PARAMS, get_param
 
-
-@dataclass
-class Signal:
-    """Sinal de trading otimizado."""
-    direction: str  # 'long', 'short', 'none'
-    strength: float  # 0-10
-    entry_price: float
-    stop_loss: float
-    take_profit: float
-    reason: str
-    strategy: str = ""  # Nome da estratégia que gerou
-    confidence: float = 0.0  # 0-1 confiança do sinal
+# Signal importado de signals.py - classe única
+from .signals import Signal
 
 
 class OptimizedStrategies:
@@ -656,61 +646,9 @@ class OptimizedStrategies:
 
 
 # =============================================================================
-# PARÂMETROS OTIMIZADOS RECOMENDADOS
+# PARÂMETROS OTIMIZADOS
 # =============================================================================
-OPTIMIZED_PARAMS = {
-    "name": "Optimized_V2_LongBias",
-    "description": "Estratégias otimizadas com viés LONG baseado em performance real",
-
-    # RSI
-    "rsi_period": 14,
-    "rsi_oversold": 25,
-    "rsi_overbought": 75,
-
-    # Stochastic
-    "stoch_k": 14,
-    "stoch_d": 3,
-    "stoch_oversold": 25,
-    "stoch_overbought": 75,
-
-    # ATR/SL/TP
-    "atr_period": 14,
-    "sl_atr_mult": 3.5,  # Mais largo para menos stop-outs
-    "tp_atr_mult": 5.5,  # Mantém R:R 1.57
-
-    # EMAs
-    "ema_fast": 8,
-    "ema_slow": 21,
-    "ema_trend": 50,
-
-    # ADX
-    "adx_period": 14,
-    "adx_min": 18,
-    "adx_strong": 25,
-    "adx_very_strong": 35,
-
-    # Momentum
-    "momentum_adx_min": 22,
-    "momentum_min_move": 0.7,
-    "momentum_rsi_long_min": 45,
-    "momentum_rsi_long_max": 65,
-    "momentum_rsi_short_min": 35,
-    "momentum_rsi_short_max": 55,
-
-    # Mean Reversion
-    "mr_adx_max": 22,
-    "mr_rsi_long": 35,
-    "mr_rsi_short": 65,
-    "mr_bb_touch_pct": 0.02,
-
-    # Bias (baseado em 63.6% vs 46.4% WR real)
-    "long_bias": 1.1,
-    "short_penalty": 0.9,
-
-    # Risk
-    "risk_per_trade": 0.015,  # 1.5% (entre conservador e agressivo)
-    "max_positions": 12,
-
-    # Strategy
-    "strategy": "stoch_extreme_v2",
-}
+# NOTA: Parâmetros centralizados em core/config.py (WFO_VALIDATED_PARAMS)
+# Use: from core.config import get_validated_params, get_param
+# NÃO defina parâmetros aqui para evitar duplicação/conflitos
+# =============================================================================
