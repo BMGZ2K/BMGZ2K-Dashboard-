@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(del \"C:\\Users\\email\\OneDrive\\Desktop\\desafio maior lucro possivel\\state\\current_best.json\")",
+      "Bash(Remove-Item \"C:\\Users\\email\\OneDrive\\Desktop\\desafio maior lucro possivel\\state\\current_best.json\" -Force -ErrorAction SilentlyContinue)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

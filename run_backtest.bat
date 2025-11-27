@@ -1,12 +1,12 @@
 @echo off
 echo ============================================
-echo   Trading Bot - Sistema Automatizado
+echo   Backtest Rapido
 echo ============================================
 echo.
 
 cd /d "%~dp0"
 
-echo Iniciando Bot...
-python bot.py
+echo Executando Backtest...
+python backtest.py --symbol BTC/USDT --timeframe 1h --days 60
 
 pause

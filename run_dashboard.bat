@@ -1,4 +1,9 @@
 @echo off
-echo Starting Dashboard...
-streamlit run src/dashboard.py
+title Trading Dashboard
+echo ============================================
+echo   TRADING DASHBOARD
+echo   Acesse: http://localhost:5000
+echo ============================================
+echo.
+python dashboard.py
 pause

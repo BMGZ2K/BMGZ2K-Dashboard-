@@ -1,11 +1,31 @@
+# Environment
 .env
+.factory/
+
+# Python
 __pycache__/
 *.pyc
-.factory/
-bot.log
-bot_clean.log
-error.log
-compile_error.log
-evolution.log
-debug_*.txt
+*.pyo
+*.egg-info/
+venv/
+
+# Logs
+*.log
+logs/
+
+# Models & Data
 *.pkl
+*.csv
+models/
+state/
+results/
+
+# Scripts auxiliares (análises, validações, otimizações antigas)
+scripts/
+
+# IDE
+.vscode/
+.idea/
+
+# System
+nul
