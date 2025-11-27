@@ -20,8 +20,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from flask import Flask, render_template, jsonify
 import ccxt
 
-from core.config import API_KEY, SECRET_KEY, USE_TESTNET, SYMBOLS, PRIMARY_TIMEFRAME
+from core.config import (
+    API_KEY, SECRET_KEY, USE_TESTNET, SYMBOLS, PRIMARY_TIMEFRAME,
+    LEVERAGE_CAP, get_wfo_config
+)
 from core.evolution import get_storage
+from core.utils import load_json_safe
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -125,19 +129,7 @@ def get_exchange():
     return exchange
 
 
-def load_json_safe(filepath):
-    """Carregar JSON com tratamento de erro."""
-    try:
-        if os.path.exists(filepath):
-            with open(filepath, 'r', encoding='utf-8') as f:
-                return json.load(f)
-    except FileNotFoundError:
-        logger.debug(f"Arquivo não encontrado: {filepath}")
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON inválido em {filepath}: {e}")
-    except Exception as e:
-        logger.error(f"Erro ao carregar {filepath}: {e}")
-    return {}
+
 
 
 def get_trader_state_cached():
@@ -381,15 +373,17 @@ def api_strategies():
             wfo = s.get('wfo', {})
             status = s.get('status', {})
 
-            # Calcular leverage seguro e retorno anual estimado
+            # Calcular leverage seguro e retorno anual estimado (usando config)
+            wfo_config = get_wfo_config()
+            test_days = wfo_config.get('test_days', 10)
+
             max_dd = metrics.get('max_drawdown', 1) or 1
-            safe_lev = min(10, int(50 / max_dd)) if max_dd > 0 else 5
+            # Safe leverage: min(config max, 50/drawdown)
+            safe_lev = min(LEVERAGE_CAP, int(50 / max_dd)) if max_dd > 0 else LEVERAGE_CAP // 2
             avg_ret = metrics.get('avg_return', 0)
 
-            # avg_ret é por fold (~15 dias). Anualização com compounding:
-            # Se temos X% por fold de 15 dias, temos ~24 folds por ano
-            # Retorno anual = (1 + X/100)^24 - 1
-            num_periods = 365 / 15  # ~24.3 períodos por ano
+            # avg_ret é por fold (~test_days). Anualização com compounding:
+            num_periods = 365 / test_days
             if avg_ret > -100:  # Evitar erro matemático
                 annual = ((1 + avg_ret / 100) ** num_periods - 1) * 100
             else:
@@ -481,7 +475,8 @@ def api_strategy_detail(strategy_id):
             'wfo': {
                 'num_folds': strategy.num_folds,
                 'wfo_score': strategy.wfo_score,
-                'robustness_score': strategy.robustness_score,
+                'robustness': strategy.robustness_score,  # Padronizado
+                'robustness_score': strategy.robustness_score,  # Alias para compatibilidade
                 'fold_results': strategy.fold_results,
             },
             'status': {

@@ -1325,8 +1325,8 @@
                             </div>
                             <div class="detail-item">
                                 <div class="detail-item-label">Robustez</div>
-                                <div class="detail-item-value" style="color: ${(wfo.robustness_score || 0) >= 70 ? '#10b981' : '#f59e0b'};">
-                                    ${(wfo.robustness_score || 0).toFixed(1)}%
+                                <div class="detail-item-value" style="color: ${(wfo.robustness || wfo.robustness_score || 0) >= 70 ? '#10b981' : '#f59e0b'};">
+                                    ${(wfo.robustness || wfo.robustness_score || 0).toFixed(1)}%
                                 </div>
                             </div>
                             <div class="detail-item">
@@ -1423,16 +1423,21 @@
                 const exitTime = new Date(t.exit_time).toLocaleString('pt-BR', {
                     day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'
                 });
-                
+
+                // Formatar quantidade de forma inteligente
+                const qty = parseFloat(t.quantity);
+                const qtyFormatted = qty >= 1000 ? qty.toLocaleString('en-US', {maximumFractionDigits: 2}) :
+                                     qty >= 1 ? qty.toFixed(4) : qty.toPrecision(4);
+
                 return `
                     <tr>
                         <td>${t.id || '-'}</td>
                         <td><strong>${t.symbol}</strong></td>
                         <td><span class="badge ${sideClass}">${t.side.toUpperCase()}</span></td>
                         <td><span class="badge badge-strategy">${t.strategy || 'N/A'}</span></td>
-                        <td>${formatCurrency(t.entry_price)}</td>
-                        <td>${formatCurrency(t.exit_price)}</td>
-                        <td>${parseFloat(t.quantity).toFixed(4)}</td>
+                        <td>${formatPrice(t.entry_price)}</td>
+                        <td>${formatPrice(t.exit_price)}</td>
+                        <td>${qtyFormatted}</td>
                         <td style="color: ${pnlColor}; font-weight: 600;">${formatCurrency(t.pnl)}</td>
                         <td style="color: ${pnlColor};">${(t.pnl_pct || 0).toFixed(2)}%</td>
                         <td style="font-size: 11px; max-width: 150px; overflow: hidden; text-overflow: ellipsis;">${t.reason_entry || '-'}</td>

@@ -11,6 +11,8 @@ from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 import hashlib
 
+from .utils import save_json_atomic, load_json_safe
+
 
 @dataclass
 class FoldResult:
@@ -102,16 +104,15 @@ class StrategyStorage:
         """Carregar estratégias do arquivo."""
         if os.path.exists(self.strategies_file):
             try:
-                with open(self.strategies_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    for s in data.get('strategies', []):
-                        try:
-                            # Converter formato antigo para novo se necessário
-                            normalized = self._normalize_strategy_data(s)
-                            strategy = ValidatedStrategy(**normalized)
-                            self._strategies[strategy.id] = strategy
-                        except Exception as e:
-                            print(f"Erro carregando estratégia {s.get('id', 'unknown')}: {e}")
+                data = load_json_safe(self.strategies_file)
+                for s in data.get('strategies', []):
+                    try:
+                        # Converter formato antigo para novo se necessário
+                        normalized = self._normalize_strategy_data(s)
+                        strategy = ValidatedStrategy(**normalized)
+                        self._strategies[strategy.id] = strategy
+                    except Exception as e:
+                        print(f"Erro carregando estratégia {s.get('id', 'unknown')}: {e}")
             except Exception as e:
                 print(f"Erro carregando arquivo de estratégias: {e}")
 
@@ -229,8 +230,7 @@ class StrategyStorage:
             # Carregar estado atual do trader
             trader_state = {}
             if os.path.exists(trader_state_file):
-                with open(trader_state_file, 'r', encoding='utf-8') as f:
-                    trader_state = json.load(f)
+                trader_state = load_json_safe(trader_state_file)
 
             # Atualizar campos de sincronização (novo formato)
             trader_state['active_strategy'] = strategy.strategy_type
@@ -251,8 +251,7 @@ class StrategyStorage:
                     trader_state['params'][key] = value
 
             # Salvar
-            with open(trader_state_file, 'w', encoding='utf-8') as f:
-                json.dump(trader_state, f, indent=2, ensure_ascii=False)
+            save_json_atomic(trader_state_file, trader_state)
 
             print(f"trader_state sincronizado com estratégia {strategy.name}")
 
@@ -544,8 +543,7 @@ class StrategyStorage:
         current_best_file = os.path.join(self.base_path, "current_best.json")
         if os.path.exists(current_best_file):
             try:
-                with open(current_best_file, 'r', encoding='utf-8') as f:
-                    best = json.load(f)
+                best = load_json_safe(current_best_file)
 
                 # Extrair tipo de estratégia (pode estar em diferentes lugares)
                 best_params = best.get('params', {})
@@ -582,8 +580,7 @@ class StrategyStorage:
         trader_state_file = os.path.join(self.base_path, "trader_state.json")
         if os.path.exists(trader_state_file):
             try:
-                with open(trader_state_file, 'r', encoding='utf-8') as f:
-                    trader = json.load(f)
+                trader = load_json_safe(trader_state_file)
 
                 # Campos podem estar em diferentes lugares:
                 # - active_strategy (novo formato de sync)

@@ -30,10 +30,11 @@ SYMBOLS = [
 
 # =============================================================================
 # RISK MANAGEMENT
+# NOTA: Valores aqui são GLOBAIS. Para trading, use WFO_VALIDATED_PARAMS
 # =============================================================================
-MAX_POSITIONS = 15
-LEVERAGE_CAP = 12
-RISK_PER_TRADE = 0.02  # 2% risk per trade
+MAX_POSITIONS = 10  # Alinhado com WFO_VALIDATED_PARAMS['max_positions']
+LEVERAGE_CAP = 10   # Alinhado com WFO_VALIDATED_PARAMS['max_leverage']
+RISK_PER_TRADE = 0.01  # 1% - Alinhado com WFO_VALIDATED_PARAMS['risk_per_trade']
 MAX_PORTFOLIO_RISK = 0.20  # 20% max portfolio risk
 CIRCUIT_BREAKER_DRAWDOWN = 0.25  # 25% drawdown triggers halt
 COOLDOWN_MINUTES = 3
@@ -277,6 +278,23 @@ BACKTEST_RESULTS = "results/backtest_results.json"
 PRIMARY_TIMEFRAME = '1h'  # Otimizado: SOL stoch_extreme validado WFO
 HTF_TIMEFRAME = '4h'
 LTF_TIMEFRAME = '15m'
+
+# Intervalos de polling (segundos) baseados no timeframe
+# Verifica a cada X segundos para não perder sinais
+POLLING_INTERVALS = {
+    '1m': 10,     # 10 segundos
+    '3m': 20,     # 20 segundos
+    '5m': 30,     # 30 segundos
+    '15m': 60,    # 1 minuto
+    '30m': 120,   # 2 minutos
+    '1h': 60,     # 1 minuto (verificar frequentemente)
+    '4h': 300,    # 5 minutos
+    '1d': 900,    # 15 minutos
+}
+
+def get_polling_interval(timeframe: str) -> int:
+    """Retorna intervalo de polling em segundos para um timeframe."""
+    return POLLING_INTERVALS.get(timeframe, 60)
 
 # =============================================================================
 # METRICS THRESHOLDS (For Strategy Validation)

@@ -430,23 +430,20 @@ class SignalGenerator:
         if stoch_k < self.stoch_oversold and stoch_cross_up:
             if ema_cross_up or (ema_f > ema_s and trend_strong):
                 direction = 'long'
-                # Cálculo otimizado de strength
-                base_strength = 6.0
+                # Cálculo otimizado de strength (usando params)
                 oversold_bonus = min(2.0, (self.stoch_oversold - stoch_k) / 5)
                 trend_bonus = 2.0 if ema_cross_up else min(2.0, (adx - self.adx_min) / 15)
-                strength = min(10, base_strength + oversold_bonus + trend_bonus)
+                strength = min(self.max_signal_strength, self.stoch_base_strength + oversold_bonus + trend_bonus)
                 reason = f'Stoch extreme up ({stoch_k:.0f}) + EMA bull + ADX {adx:.0f}'
 
         # Short: Stochastic overbought EXTREMO com cross down + confirmação de trend
-        # OTIMIZADO: Removido -10, agora usa zona extrema estrita
         elif stoch_k > self.stoch_overbought and stoch_cross_down:
             if ema_cross_down or (ema_f < ema_s and trend_strong):
                 direction = 'short'
-                # Cálculo otimizado de strength
-                base_strength = 6.0
+                # Cálculo otimizado de strength (usando params)
                 overbought_bonus = min(2.0, (stoch_k - self.stoch_overbought) / 5)
                 trend_bonus = 2.0 if ema_cross_down else min(2.0, (adx - self.adx_min) / 15)
-                strength = min(10, base_strength + overbought_bonus + trend_bonus)
+                strength = min(self.max_signal_strength, self.stoch_base_strength + overbought_bonus + trend_bonus)
                 reason = f'Stoch extreme down ({stoch_k:.0f}) + EMA bear + ADX {adx:.0f}'
 
         # Sinais mais agressivos: EMA cross com ADX forte (mesmo sem stochastic extremo)
@@ -624,21 +621,7 @@ class SignalGenerator:
 
         return Signal(direction, strength, price, sl, tp, reason)
 
-    def _signal_combined(self, df: pd.DataFrame) -> Signal:
-        """Combinar multiplas estrategias."""
-        rsi_signal = self._signal_rsi_extremes(df)
-        trend_signal = self._signal_trend_following(df)
-        mr_signal = self._signal_mean_reversion(df)
-        
-        # Priorizar por strength
-        signals = [rsi_signal, trend_signal, mr_signal]
-        valid_signals = [s for s in signals if s.direction != 'none']
-        
-        if not valid_signals:
-            return Signal('none', 0, df.iloc[-1]['close'], 0, 0, 'Sem sinal')
-        
-        # Retornar o mais forte
-        return max(valid_signals, key=lambda s: s.strength)
+
 
 
 def check_exit_signal(
@@ -647,7 +630,9 @@ def check_exit_signal(
     current_high: float,
     current_low: float,
     atr: float,
-    rsi: float = 50
+    rsi: float = 50,
+    rsi_exit_long: float = 70,
+    rsi_exit_short: float = 30
 ) -> Optional[str]:
     """
     Verificar sinais de saida.
@@ -667,7 +652,7 @@ def check_exit_signal(
         if tp > 0 and current_high >= tp:
             return 'TAKE_PROFIT'
         # RSI overbought em posicao long lucrativa
-        if rsi > 70 and current_price > entry * 1.01:
+        if rsi > rsi_exit_long and current_price > entry * 1.01:
             return 'RSI_EXIT'
     else:
         # Só verificar SL/TP se estiverem definidos (> 0)
@@ -675,7 +660,7 @@ def check_exit_signal(
             return 'STOP_LOSS'
         if tp > 0 and current_low <= tp:
             return 'TAKE_PROFIT'
-        if rsi < 30 and current_price < entry * 0.99:
+        if rsi < rsi_exit_short and current_price < entry * 0.99:
             return 'RSI_EXIT'
     
     return None

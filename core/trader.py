@@ -11,7 +11,9 @@ import os
 import logging
 
 from .signals import SignalGenerator, check_exit_signal
-from .config import get_validated_params
+from .config import get_validated_params, get_backtest_config
+from .utils import save_json_atomic, load_json_safe
+from .binance_fees import get_binance_fees
 
 log = logging.getLogger(__name__)
 
@@ -24,7 +26,10 @@ class Trade:
     entry_price: float
     exit_price: float = 0.0
     quantity: float = 0.0
-    pnl: float = 0.0
+    pnl: float = 0.0  # PnL líquido (após taxas)
+    pnl_gross: float = 0.0  # PnL bruto (antes das taxas)
+    commission: float = 0.0  # Taxa de trading (entrada + saída)
+    funding_cost: float = 0.0  # Custo de funding
     entry_time: str = ""
     exit_time: str = ""
     reason_entry: str = ""
@@ -46,6 +51,7 @@ class Position:
     min_price: float = float('inf')
     reason_entry: str = ""
     strategy: str = "unknown"
+    order_id: str = ""  # ID único da Binance para evitar duplicatas
 
 
 class Trader:
@@ -56,16 +62,19 @@ class Trader:
     def __init__(self, params: Dict = None):
         self.params = params or self._default_params()
         self.signal_generator = SignalGenerator(self.params)
-        
+
         self.positions: Dict[str, Position] = {}
         self.trades: List[Trade] = []
-        self.balance = 10000.0
-        self.initial_balance = 10000.0
-        
-        # Risk params
+
+        # Balance inicial do config (será sobrescrito por load_state ou update_balance)
+        backtest_config = get_backtest_config()
+        self.balance = float(backtest_config.get('initial_capital', 10000))
+        self.initial_balance = self.balance
+
+        # Risk params (do config centralizado)
         self.risk_per_trade = self.params.get('risk_per_trade', 0.01)
-        self.max_positions = self.params.get('max_positions', 5)
-        self.max_drawdown = self.params.get('max_drawdown', 0.20)
+        self.max_positions = self.params.get('max_positions', 10)
+        self.max_drawdown = self.params.get('max_drawdown', backtest_config.get('max_drawdown_halt', 0.20))
         
         # State
         self.high_water_mark = self.balance
@@ -107,22 +116,39 @@ class Trader:
     
     def calculate_position_size(self, price: float, stop_loss: float) -> float:
         """Calcular tamanho da posicao baseado em risco."""
+        # Parâmetros do config
+        max_leverage = self.params.get('max_leverage', 10)
+        max_position_pct = self.params.get('max_position_pct', 0.15)  # 15% max por posição
+        min_position_pct = self.params.get('min_position_pct', 0.05)  # 5% min por posição
+        min_notional = self.params.get('min_notional', 6.0)
+
         risk_amount = self.balance * self.risk_per_trade
         stop_distance = abs(price - stop_loss)
-        
+
         if stop_distance == 0:
             return 0.0
-        
+
+        # Quantidade baseada no risco
         quantity = risk_amount / stop_distance
-        
-        # Limitar a 10x leverage
-        max_quantity = (self.balance * 10) / price
-        quantity = min(quantity, max_quantity)
-        
-        # Minimo notional
-        if quantity * price < 10:
+
+        # Limitar pelo leverage máximo
+        max_quantity_leverage = (self.balance * max_leverage) / price
+        quantity = min(quantity, max_quantity_leverage)
+
+        # Limitar pelo % máximo da posição
+        max_quantity_pct = (self.balance * max_position_pct * max_leverage) / price
+        quantity = min(quantity, max_quantity_pct)
+
+        # Garantir quantidade mínima (% mínimo do balance)
+        min_quantity = (self.balance * min_position_pct) / price
+        if quantity < min_quantity:
+            quantity = min_quantity
+
+        # Verificar notional mínimo
+        notional = quantity * price
+        if notional < min_notional:
             return 0.0
-        
+
         return quantity
     
     def process_candle(self, symbol: str, df: pd.DataFrame) -> Optional[Dict]:
@@ -183,7 +209,9 @@ class Trader:
             current_high=high,
             current_low=low,
             atr=atr,
-            rsi=rsi
+            rsi=rsi,
+            rsi_exit_long=self.params.get('rsi_exit_long', 70),
+            rsi_exit_short=self.params.get('rsi_exit_short', 30)
         )
         
         if exit_reason:
@@ -221,8 +249,12 @@ class Trader:
             'strength': signal.strength
         }
     
-    def record_entry(self, symbol: str, side: str, price: float, quantity: float, sl: float, tp: float, reason: str, strategy: str = None):
+    def record_entry(self, symbol: str, side: str, price: float, quantity: float, sl: float, tp: float, reason: str, strategy: str = None, order_id: str = None):
         """Registrar entrada."""
+        # Criar order_id único se não fornecido
+        if not order_id:
+            order_id = f"{symbol.replace('/', '')}_{price}_{quantity}_{datetime.now().timestamp()}"
+
         self.positions[symbol] = Position(
             symbol=symbol,
             side='long' if side == 'buy' else 'short',
@@ -234,7 +266,8 @@ class Trader:
             max_price=price,
             min_price=price,
             reason_entry=reason,
-            strategy=strategy or self.params.get('strategy', 'unknown')
+            strategy=strategy or self.params.get('strategy', 'unknown'),
+            order_id=order_id
         )
     
     def record_exit(self, symbol: str, exit_price: float, reason: str) -> float:
@@ -251,15 +284,51 @@ class Trader:
             log.debug(f"record_exit ignorado para {symbol}: fechamento já em andamento")
             return 0.0
         pos._closing = True  # Marcar que está fechando
-        
+
+        # Obter taxas dinâmicas da Binance
+        try:
+            binance_fees = get_binance_fees(use_testnet=True)
+            raw_symbol = symbol.replace('/', '')
+            fees = binance_fees.get_all_fees_for_symbol(raw_symbol)
+            taker_fee = fees.get('taker_fee', 0.0004)
+            funding_rate = fees.get('funding_rate', 0.0001)
+        except Exception:
+            # Fallback para taxas padrão
+            taker_fee = 0.0004
+            funding_rate = 0.0001
+
+        # PnL bruto
         if pos.side == 'long':
             pnl = (exit_price - pos.entry_price) * pos.quantity
         else:
             pnl = (pos.entry_price - exit_price) * pos.quantity
-        
-        # Comissao
-        commission = (pos.entry_price + exit_price) * pos.quantity * 0.0004
-        net_pnl = pnl - commission
+
+        # Custos de trading (entrada + saída)
+        notional_entry = pos.entry_price * pos.quantity
+        notional_exit = exit_price * pos.quantity
+        commission = (notional_entry + notional_exit) * taker_fee
+
+        # Calcular funding pago durante a posição
+        # Funding é cobrado a cada 8h. Estimamos baseado no tempo da posição
+        try:
+            entry_time = datetime.fromisoformat(pos.entry_time)
+            exit_time = datetime.now()
+            hours_held = (exit_time - entry_time).total_seconds() / 3600
+            funding_periods = hours_held / 8  # Número de períodos de funding
+            # Funding = notional * rate * períodos
+            # Long paga quando rate positivo, short recebe
+            avg_notional = (notional_entry + notional_exit) / 2
+            if pos.side == 'long':
+                funding_cost = avg_notional * funding_rate * funding_periods
+            else:
+                funding_cost = -avg_notional * funding_rate * funding_periods  # Short recebe
+        except Exception:
+            funding_cost = 0
+
+        # PnL líquido = bruto - comissão - funding
+        net_pnl = pnl - commission - funding_cost
+
+        log.debug(f"PnL {symbol}: bruto={pnl:.2f}, commission={commission:.2f}, funding={funding_cost:.2f}, net={net_pnl:.2f}")
         
         # Registrar trade com detalhes
         trade = Trade(
@@ -269,6 +338,9 @@ class Trader:
             exit_price=exit_price,
             quantity=pos.quantity,
             pnl=net_pnl,
+            pnl_gross=pnl,
+            commission=commission,
+            funding_cost=funding_cost,
             entry_time=pos.entry_time,
             exit_time=datetime.now().isoformat(),
             reason_entry=getattr(pos, 'reason_entry', ''),
@@ -277,11 +349,13 @@ class Trader:
         )
         # Adicionar atributos extras
         trade.strategy = getattr(pos, 'strategy', self.params.get('strategy', 'unknown'))
-        trade.pnl_pct = (net_pnl / (pos.entry_price * pos.quantity)) * 100
+        trade.pnl_pct = (net_pnl / notional_entry) * 100 if notional_entry > 0 else 0
+        trade.order_id = getattr(pos, 'order_id', '')  # ID único da Binance
         self.trades.append(trade)
         
         # Salvar historico em arquivo
         self._save_trade_history(trade)
+        self._save_trade_csv(trade)
         
         # Remover posicao
         del self.positions[symbol]
@@ -330,17 +404,36 @@ class Trader:
         history = []
         try:
             if os.path.exists(history_file):
-                with open(history_file, 'r') as f:
-                    history = json.load(f)
+                history = load_json_safe(history_file, default=[])
         except Exception as e:
             log.warning(f"Erro carregando trade history: {e}")
 
         # CORRIGIDO: Gerar ID baseado no maior ID existente + 1 (não len())
         max_id = max([t.get('id', 0) for t in history], default=0) if history else 0
 
+        # Verificar duplicatas pelo order_id (mais confiável)
+        trade_order_id = getattr(trade, 'order_id', '')
+        if trade_order_id:
+            for existing in history[-100:]:
+                if existing.get('order_id') == trade_order_id:
+                    log.warning(f"Trade duplicado detectado (order_id={trade_order_id}), ignorando: {trade.symbol}")
+                    return
+
+        # Fallback: verificar por symbol + entry_price + quantity (para trades sem order_id)
+        for existing in history[-50:]:
+            is_same_symbol = existing.get('symbol') == trade.symbol
+            is_same_side = existing.get('side') == trade.side
+            is_same_entry_price = abs(existing.get('entry_price', 0) - trade.entry_price) < 0.01
+            is_same_quantity = abs(existing.get('quantity', 0) - trade.quantity) < 0.0001
+
+            if is_same_symbol and is_same_side and is_same_entry_price and is_same_quantity:
+                log.warning(f"Trade duplicado detectado (price+qty), ignorando: {trade.symbol}")
+                return
+
         # Adicionar novo trade
         trade_data = {
             'id': max_id + 1,
+            'order_id': trade_order_id,
             'symbol': trade.symbol,
             'side': trade.side,
             'strategy': getattr(trade, 'strategy', 'unknown'),
@@ -348,6 +441,9 @@ class Trader:
             'exit_price': trade.exit_price,
             'quantity': trade.quantity,
             'pnl': trade.pnl,
+            'pnl_gross': getattr(trade, 'pnl_gross', trade.pnl),
+            'commission': getattr(trade, 'commission', 0),
+            'funding_cost': getattr(trade, 'funding_cost', 0),
             'pnl_pct': getattr(trade, 'pnl_pct', 0),
             'entry_time': trade.entry_time,
             'exit_time': trade.exit_time,
@@ -360,12 +456,47 @@ class Trader:
         history = history[-500:]
         
         # Salvar
-        os.makedirs(os.path.dirname(history_file), exist_ok=True)
-        with open(history_file, 'w') as f:
-            json.dump(history, f, indent=2)
+        save_json_atomic(history_file, history)
+
+    def _save_trade_csv(self, trade: Trade):
+        """Salvar trade em CSV (append)."""
+        import csv
+        log_file = 'logs/trades.csv'
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        
+        file_exists = os.path.exists(log_file)
+        
+        try:
+            with open(log_file, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(['id', 'symbol', 'side', 'entry_price', 'exit_price', 'quantity', 'pnl', 'pnl_pct', 'entry_time', 'exit_time', 'strategy', 'reason_entry', 'reason_exit'])
+                
+                writer.writerow([
+                    getattr(trade, 'id', ''),
+                    trade.symbol,
+                    trade.side,
+                    trade.entry_price,
+                    trade.exit_price,
+                    trade.quantity,
+                    trade.pnl,
+                    getattr(trade, 'pnl_pct', 0),
+                    trade.entry_time,
+                    trade.exit_time,
+                    getattr(trade, 'strategy', 'unknown'),
+                    trade.reason_entry,
+                    trade.reason_exit
+                ])
+        except Exception as e:
+            log.error(f"Erro salvando CSV: {e}")
     
     def save_state(self, filepath: str):
         """Salvar estado."""
+        # Sempre usar params do config centralizado (fonte única de verdade)
+        current_params = get_validated_params()
+        # Mesclar com params atuais (config pode ter sido atualizado)
+        merged_params = {**self.params, **current_params}
+
         state = {
             'balance': self.balance,
             'initial_balance': self.initial_balance,
@@ -381,18 +512,16 @@ class Trader:
                     'take_profit': v.take_profit,
                     'entry_time': v.entry_time,
                     'reason_entry': getattr(v, 'reason_entry', ''),
-                    'strategy': getattr(v, 'strategy', self.params.get('strategy', 'unknown'))
+                    'strategy': getattr(v, 'strategy', merged_params.get('strategy', 'unknown'))
                 }
                 for k, v in self.positions.items()
             },
             'stats': self.get_stats(),
-            'params': self.params,
+            'params': merged_params,  # Usar params mesclados
             'timestamp': datetime.now().isoformat()
         }
-        
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, 'w') as f:
-            json.dump(state, f, indent=2)
+
+        save_json_atomic(filepath, state)
     
     def load_state(self, filepath: str):
         """Carregar estado."""
@@ -402,8 +531,7 @@ class Trader:
             return
 
         try:
-            with open(filepath, 'r') as f:
-                state = json.load(f)
+            state = load_json_safe(filepath)
 
             self.balance = state.get('balance', 10000)
             self.initial_balance = state.get('initial_balance', 10000)
@@ -426,8 +554,7 @@ class Trader:
         history_file = 'state/trade_history.json'
         try:
             if os.path.exists(history_file):
-                with open(history_file, 'r') as f:
-                    history = json.load(f)
+                history = load_json_safe(history_file, default=[])
 
                 # Converter para objetos Trade
                 self.trades = []

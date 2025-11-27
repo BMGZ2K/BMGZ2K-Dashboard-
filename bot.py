@@ -18,10 +18,11 @@ import ccxt
 from core.config import (
     API_KEY, SECRET_KEY, USE_TESTNET,
     SYMBOLS, PRIMARY_TIMEFRAME, MAX_POSITIONS,
-    WFO_VALIDATED_PARAMS, get_validated_params
+    WFO_VALIDATED_PARAMS, get_validated_params, get_polling_interval
 )
 from core.trader import Trader
 from core.signals import SignalGenerator
+from core.utils import save_json_atomic, load_json_safe
 
 # Logging
 logging.basicConfig(
@@ -71,15 +72,20 @@ class TradingBot:
             positions = account.get('positions', [])
             open_positions = [p for p in positions if float(p.get('positionAmt', 0)) != 0]
 
-            # CORRIGIDO: Usar ATR multipliers (não porcentagem!)
-            # Estes são multiplicadores de ATR, não percentuais
+            # Usar parâmetros do config (dinâmico)
             sl_atr_mult = self.params.get('sl_atr_mult', self.params.get('sl_mult', 3.0))
             tp_atr_mult = self.params.get('tp_atr_mult', self.params.get('tp_mult', 5.0))
             atr_period = self.params.get('atr_period', 14)
+            # Fallback percentuais - calculados a partir dos ATR mults (assumindo ATR ~1% do preço)
+            sl_pct_fallback = sl_atr_mult * 0.01  # ~3% se sl_atr_mult=3
+            tp_pct_fallback = tp_atr_mult * 0.01  # ~5% se tp_atr_mult=5
 
             for p in open_positions:
                 raw_sym = p.get('symbol', '')
-                sym = raw_sym.replace('USDT', '/USDT')
+                if raw_sym.endswith('USDT'):
+                    sym = raw_sym[:-4] + '/USDT'
+                else:
+                    sym = raw_sym
 
                 if sym not in self.trader.positions:
                     position_amt = float(p.get('positionAmt', 0))
@@ -101,25 +107,25 @@ class TradingBot:
                                 stop_loss = entry + (atr * sl_atr_mult)
                                 take_profit = entry - (atr * tp_atr_mult)
                         else:
-                            # Fallback: usar % conservador se não conseguir ATR
-                            sl_pct = 0.03  # 3% fallback
-                            tp_pct = 0.05  # 5% fallback
+                            # Fallback: usar % baseado nos ATR mults do config
                             if side == 'long':
-                                stop_loss = entry * (1 - sl_pct)
-                                take_profit = entry * (1 + tp_pct)
+                                stop_loss = entry * (1 - sl_pct_fallback)
+                                take_profit = entry * (1 + tp_pct_fallback)
                             else:
-                                stop_loss = entry * (1 + sl_pct)
-                                take_profit = entry * (1 - tp_pct)
+                                stop_loss = entry * (1 + sl_pct_fallback)
+                                take_profit = entry * (1 - tp_pct_fallback)
                     except Exception as e:
                         log.warning(f"Erro calculando ATR para {sym}: {e}, usando fallback")
-                        sl_pct = 0.03
-                        tp_pct = 0.05
                         if side == 'long':
-                            stop_loss = entry * (1 - sl_pct)
-                            take_profit = entry * (1 + tp_pct)
+                            stop_loss = entry * (1 - sl_pct_fallback)
+                            take_profit = entry * (1 + tp_pct_fallback)
                         else:
-                            stop_loss = entry * (1 + sl_pct)
-                            take_profit = entry * (1 - tp_pct)
+                            stop_loss = entry * (1 + sl_pct_fallback)
+                            take_profit = entry * (1 - tp_pct_fallback)
+
+                    # Criar ID único para a posição (symbol + entryPrice + qty)
+                    # Isso evita duplicatas ao sincronizar
+                    position_id = f"{raw_sym}_{entry}_{abs(position_amt)}"
 
                     # Adicionar ao estado local usando a dataclass Position
                     pos = Position(
@@ -133,7 +139,8 @@ class TradingBot:
                         max_price=entry,
                         min_price=entry,
                         reason_entry='Synced from Binance',
-                        strategy=self.params.get('strategy', 'unknown')
+                        strategy=self.params.get('strategy', 'unknown'),
+                        order_id=position_id
                     )
                     # Adicionar leverage como atributo extra
                     pos.leverage = leverage
@@ -187,36 +194,33 @@ class TradingBot:
         # PRIORIDADE 1: current_best.json (estratégia ativa)
         try:
             if os.path.exists('state/current_best.json'):
-                with open('state/current_best.json', 'r') as f:
-                    data = json.load(f)
-                    params = data.get('params', {})
-                    if params:
-                        # Normalizar nomes de parâmetros (suportar ambos formatos)
-                        params = self._normalize_params(params)
-                        log.info(f"Params carregados do current_best: {data.get('strategy_name', 'unknown')}")
-                        return {**default, **params}
+                data = load_json_safe('state/current_best.json')
+                params = data.get('params', {})
+                if params:
+                    # Normalizar nomes de parâmetros (suportar ambos formatos)
+                    params = self._normalize_params(params)
+                    log.info(f"Params carregados do current_best: {data.get('strategy_name', 'unknown')}")
+                    return {**default, **params}
         except Exception as e:
             log.warning(f"Erro ao carregar current_best: {e}")
 
         # PRIORIDADE 2: trader_state (atualizado pelo auto_evolve)
         try:
             if os.path.exists('state/trader_state.json'):
-                with open('state/trader_state.json', 'r') as f:
-                    data = json.load(f)
-                    params = data.get('params', {})
-                    if params:
-                        log.info(f"Params carregados do trader_state: strategy={params.get('strategy')}")
-                        return {**default, **params}
+                data = load_json_safe('state/trader_state.json')
+                params = data.get('params', {})
+                if params:
+                    log.info(f"Params carregados do trader_state: strategy={params.get('strategy')}")
+                    return {**default, **params}
         except Exception as e:
             log.warning(f"Erro ao carregar params do trader_state: {e}")
 
         # PRIORIDADE 3: optimized_params
         try:
             if os.path.exists('state/optimized_params.json'):
-                with open('state/optimized_params.json', 'r') as f:
-                    data = json.load(f)
-                    params = data.get('params', {})
-                    return {**default, **params}
+                data = load_json_safe('state/optimized_params.json')
+                params = data.get('params', {})
+                return {**default, **params}
         except Exception as e:
             log.warning(f"Erro ao carregar params: {e}")
 
@@ -463,23 +467,40 @@ class TradingBot:
             account = self.exchange.fapiPrivateV2GetAccount()
             positions = account.get('positions', [])
             open_positions = [p for p in positions if float(p.get('positionAmt', 0)) != 0]
-            
+
             # Normalizar símbolos (BTCUSDT -> BTC/USDT)
             exchange_symbols = set()
             for p in open_positions:
                 raw_sym = p.get('symbol', '')
-                sym = raw_sym.replace('USDT', '/USDT')
+                if raw_sym.endswith('USDT'):
+                    sym = raw_sym[:-4] + '/USDT'
+                else:
+                    sym = raw_sym
                 exchange_symbols.add(sym)
-            
+
             # Verificar posicoes fechadas externamente
             for symbol in list(self.trader.positions.keys()):
                 if symbol not in exchange_symbols:
                     log.info(f"Posicao {symbol} fechada externamente")
-                    if symbol in self.last_prices:
+                    # Buscar preço atual real da exchange (não usar last_prices que pode estar desatualizado)
+                    exit_price = self._get_current_price(symbol)
+                    if exit_price > 0:
+                        self.trader.record_exit(symbol, exit_price, 'EXTERNAL')
+                    elif symbol in self.last_prices:
+                        # Fallback para last_prices se não conseguir preço atual
                         self.trader.record_exit(symbol, self.last_prices[symbol], 'EXTERNAL')
-            
+
         except Exception as e:
             log.error(f"Erro sync: {e}")
+
+    def _get_current_price(self, symbol: str) -> float:
+        """Buscar preço atual da exchange."""
+        try:
+            ticker = self.exchange.fetch_ticker(symbol)
+            return float(ticker.get('last', 0) or ticker.get('close', 0))
+        except Exception as e:
+            log.warning(f"Erro buscando preço atual de {symbol}: {e}")
+            return 0.0
     
     def run_cycle(self):
         """Executar um ciclo de trading."""
@@ -573,10 +594,15 @@ class TradingBot:
 
                 success = self.execute_order(symbol, action['side'], action['quantity'], reduce_only=True)
 
-                if success and symbol in self.last_prices:
+                if success:
                     # Cancelar ordens SL/TP da exchange quando fechamos manualmente
                     self._cancel_sl_tp_orders(symbol)
-                    self.trader.record_exit(symbol, self.last_prices[symbol], action['reason'])
+                    # Buscar preço real de execução
+                    exit_price = self._get_current_price(symbol)
+                    if exit_price <= 0 and symbol in self.last_prices:
+                        exit_price = self.last_prices[symbol]
+                    if exit_price > 0:
+                        self.trader.record_exit(symbol, exit_price, action['reason'])
         
         # Salvar estado
         self.trader.save_state('state/trader_state.json')
@@ -588,26 +614,22 @@ class TradingBot:
     def run(self):
         """Loop principal."""
         log.info("Iniciando loop de trading...")
-        
-        # Intervalo baseado no timeframe
-        if PRIMARY_TIMEFRAME == '1h':
-            interval = 60  # 1 minuto (verificar a cada minuto)
-        elif PRIMARY_TIMEFRAME == '4h':
-            interval = 300  # 5 minutos
-        else:
-            interval = 30  # 30 segundos para timeframes menores
-        
+
+        # Intervalo dinâmico baseado no timeframe (do config)
+        interval = get_polling_interval(PRIMARY_TIMEFRAME)
+        log.info(f"Polling interval: {interval}s para timeframe {PRIMARY_TIMEFRAME}")
+
         while self.running:
             try:
                 self.run_cycle()
                 time.sleep(interval)
-                
+
             except KeyboardInterrupt:
                 log.info("Bot parado pelo usuario")
                 self.running = False
             except Exception as e:
                 log.error(f"Erro no loop: {e}")
-                time.sleep(60)
+                time.sleep(interval)  # Usar mesmo intervalo no erro
         
         # Salvar estado final
         self.trader.save_state('state/trader_state.json')

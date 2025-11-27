@@ -51,10 +51,10 @@ class RiskManager:
     
     def __init__(
         self,
-        risk_per_trade: float = 0.02,
+        risk_per_trade: float = 0.01,  # Alinhado com WFO_VALIDATED_PARAMS
         max_portfolio_risk: float = 0.20,
-        leverage_cap: int = 12,
-        max_positions: int = 15,
+        leverage_cap: int = 10,  # Alinhado com WFO_VALIDATED_PARAMS['max_leverage']
+        max_positions: int = 10,  # Alinhado com WFO_VALIDATED_PARAMS['max_positions']
         circuit_breaker_drawdown: float = 0.25
     ):
         self.risk_per_trade = risk_per_trade
