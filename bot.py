@@ -22,18 +22,25 @@ from core.config import (
 )
 from core.trader import Trader
 from core.signals import SignalGenerator
-from core.utils import save_json_atomic, load_json_safe
+from core.utils import save_json_atomic, load_json_safe, setup_rotating_logger
 
-# Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[
-        logging.FileHandler("logs/bot.log", encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
+# Diretório de logs
+os.makedirs('logs', exist_ok=True)
+
+# Logging com rotação automática (5MB por arquivo, 5 backups)
+log = setup_rotating_logger(
+    name='trading_bot',
+    log_file='logs/bot.log',
+    max_bytes=5 * 1024 * 1024,  # 5MB
+    backup_count=5,
+    level=logging.INFO
 )
-log = logging.getLogger(__name__)
+
+# Também adicionar handler para stdout
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
+log.addHandler(console_handler)
 
 
 class TradingBot:
@@ -335,9 +342,10 @@ class TradingBot:
             # Ajustar precisao
             if precision:
                 quantity = round(quantity, precision)
-            
+
             return quantity
-        except:
+        except Exception as e:
+            log.debug(f"Erro validando quantidade para {symbol}: {e}")
             return quantity
     
     def set_leverage(self, symbol: str, leverage: int = 5) -> bool:

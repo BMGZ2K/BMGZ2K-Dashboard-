@@ -552,8 +552,8 @@ def api_trades():
                 trades = json.load(f)
                 trades = trades[-50:]  # Ultimos 50
                 trades.reverse()  # Mais recentes primeiro
-    except:
-        pass
+    except Exception as e:
+        log.warning(f"Erro ao carregar trade_history.json: {e}")
     
     # Calcular estatisticas por estrategia
     strategy_stats = {}
@@ -586,8 +586,8 @@ def api_logs():
             with open('logs/bot.log', 'r', encoding='utf-8') as f:
                 lines = f.readlines()
                 logs = [l.strip() for l in lines[-100:]]
-    except:
-        pass
+    except Exception as e:
+        log.warning(f"Erro ao ler logs/bot.log: {e}")
 
     return jsonify({'logs': logs})
 

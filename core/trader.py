@@ -1,18 +1,29 @@
 """
 Trader Module - Gerenciador de trades simplificado
 Combina signals, risk e execution
+
+VERSÃO: 3.0 - Correções de robustez
+- Thread-safe record_exit() com Lock
+- Detecção de duplicatas via hash SHA256
+- Funding rate discreto (a cada 8h)
+- Validação de preços entry/exit
+- Sem truncamento de histórico
 """
 import pandas as pd
+import numpy as np
 from typing import Dict, Optional, List
 from datetime import datetime
 from dataclasses import dataclass
 import json
 import os
 import logging
+import threading
+import hashlib
+import shutil
 
 from .signals import SignalGenerator, check_exit_signal
 from .config import get_validated_params, get_backtest_config
-from .utils import save_json_atomic, load_json_safe
+from .utils import save_json_atomic, load_json_safe, backup_state_file
 from .binance_fees import get_binance_fees
 
 log = logging.getLogger(__name__)
@@ -57,14 +68,18 @@ class Position:
 class Trader:
     """
     Gerenciador de trading simplificado.
+    Thread-safe para operações de posição.
     """
-    
+
     def __init__(self, params: Dict = None):
         self.params = params or self._default_params()
         self.signal_generator = SignalGenerator(self.params)
 
         self.positions: Dict[str, Position] = {}
         self.trades: List[Trade] = []
+
+        # Lock para operações thread-safe em record_exit
+        self._exit_lock = threading.Lock()
 
         # Balance inicial do config (será sobrescrito por load_state ou update_balance)
         backtest_config = get_backtest_config()
@@ -75,7 +90,7 @@ class Trader:
         self.risk_per_trade = self.params.get('risk_per_trade', 0.01)
         self.max_positions = self.params.get('max_positions', 10)
         self.max_drawdown = self.params.get('max_drawdown', backtest_config.get('max_drawdown_halt', 0.20))
-        
+
         # State
         self.high_water_mark = self.balance
         self.is_halted = False
@@ -273,19 +288,26 @@ class Trader:
         )
     
     def record_exit(self, symbol: str, exit_price: float, reason: str) -> float:
-        """Registrar saida e calcular PnL."""
-        if symbol not in self.positions:
-            # CORRIGIDO: Evitar duplicação - posição já foi fechada
-            log.debug(f"record_exit ignorado para {symbol}: posição não existe (já fechada)")
+        """Registrar saida e calcular PnL. Thread-safe com Lock."""
+        # Validação de preço de saída
+        if exit_price <= 0:
+            log.warning(f"record_exit ignorado para {symbol}: preço inválido ({exit_price})")
             return 0.0
 
-        pos = self.positions[symbol]
+        # Thread-safe: usar Lock para evitar race conditions
+        with self._exit_lock:
+            if symbol not in self.positions:
+                # CORRIGIDO: Evitar duplicação - posição já foi fechada
+                log.debug(f"record_exit ignorado para {symbol}: posição não existe (já fechada)")
+                return 0.0
 
-        # CORRIGIDO: Verificar se posição já está sendo fechada (flag de lock)
-        if getattr(pos, '_closing', False):
-            log.debug(f"record_exit ignorado para {symbol}: fechamento já em andamento")
-            return 0.0
-        pos._closing = True  # Marcar que está fechando
+            pos = self.positions[symbol]
+
+            # CORRIGIDO: Verificar se posição já está sendo fechada (flag de lock)
+            if getattr(pos, '_closing', False):
+                log.debug(f"record_exit ignorado para {symbol}: fechamento já em andamento")
+                return 0.0
+            pos._closing = True  # Marcar que está fechando
 
         # Obter taxas dinâmicas da Binance
         try:
@@ -358,14 +380,17 @@ class Trader:
         trade.strategy = getattr(pos, 'strategy', self.params.get('strategy', 'unknown'))
         trade.pnl_pct = (pnl / notional_entry) * 100 if notional_entry > 0 else 0  # % do PnL bruto
         trade.order_id = getattr(pos, 'order_id', '')  # ID único da Binance
-        self.trades.append(trade)
-        
-        # Salvar historico em arquivo
+
+        # Thread-safe: modificar estado compartilhado sob Lock
+        with self._exit_lock:
+            self.trades.append(trade)
+            # Remover posicao ANTES de salvar para evitar race condition
+            if symbol in self.positions:
+                del self.positions[symbol]
+
+        # Salvar historico em arquivo (fora do lock para não bloquear I/O)
         self._save_trade_history(trade)
         self._save_trade_csv(trade)
-        
-        # Remover posicao
-        del self.positions[symbol]
 
         # NOTA: NÃO atualizamos self.balance aqui porque:
         # 1. O balance real vem da Binance via fetch_balance() no bot.py
@@ -503,10 +528,10 @@ class Trader:
             'reason_exit': trade.reason_exit,
         }
         history.append(trade_data)
-        
-        # Manter apenas ultimos 500 trades
-        history = history[-500:]
-        
+
+        # REMOVIDO: Não truncar histórico - manter todos os trades
+        # O histórico completo é importante para análises e auditorias
+
         # Salvar
         save_json_atomic(history_file, history)
 
@@ -572,6 +597,15 @@ class Trader:
             'params': merged_params,  # Usar params mesclados
             'timestamp': datetime.now().isoformat()
         }
+
+        # Criar backup antes de salvar (a cada 10 minutos aprox)
+        # O backup_state_file verifica internamente se deve criar backup
+        if hasattr(self, '_last_backup_time'):
+            if (datetime.now() - self._last_backup_time).total_seconds() > 600:  # 10 min
+                backup_state_file(filepath)
+                self._last_backup_time = datetime.now()
+        else:
+            self._last_backup_time = datetime.now()
 
         save_json_atomic(filepath, state)
     

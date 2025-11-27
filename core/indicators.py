@@ -36,8 +36,9 @@ def calculate_indicators(df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, 
     df['rsi'] = ta.rsi(calc_close, length=rsi_len)
     df['rsi_sma'] = ta.sma(df['rsi'], length=3)  # Smoothed RSI
     
-    # ADX
-    adx_result = ta.adx(calc_high, calc_low, calc_close, length=14)
+    # ADX (período centralizado no config)
+    adx_period = params.get('adx_period', 14)
+    adx_result = ta.adx(calc_high, calc_low, calc_close, length=adx_period)
     if adx_result is not None:
         adx_col = [c for c in adx_result.columns if c.startswith('ADX')][0]
         dmp_col = [c for c in adx_result.columns if c.startswith('DMP')][0]

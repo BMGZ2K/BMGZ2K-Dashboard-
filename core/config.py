@@ -1,6 +1,27 @@
 """
 Configuration Module - Unified Trading System
 High-Performance Crypto Trading with WFO Validation
+
+================================================================================
+FONTE ÚNICA DE VERDADE - CONFIGURAÇÃO CENTRALIZADA
+================================================================================
+
+Como usar:
+    from core.config import get_validated_params, get_param
+
+    # Obter todos os parâmetros validados
+    params = get_validated_params()
+
+    # Obter parâmetro específico
+    adx_period = get_param('adx_period', default=14)
+
+NÃO FAÇA:
+    - Hardcode valores nos módulos
+    - Importar WFO_VALIDATED_PARAMS diretamente (use get_validated_params())
+    - Definir parâmetros em outros arquivos
+
+VERSÃO: 2.0 - Centralização completa
+================================================================================
 """
 import os
 from dotenv import load_dotenv

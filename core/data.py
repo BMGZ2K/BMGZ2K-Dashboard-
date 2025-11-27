@@ -1,23 +1,56 @@
 """
 Data Module - Market Data Handling
 Fetch and process market data from exchange
+
+VERSÃO: 2.0
+- Cache com TTL ativo e limpeza automática
+- Logging adequado
 """
 import pandas as pd
 import numpy as np
+import logging
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
 import time
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class MarketData:
     """
     Handle market data fetching and processing.
+    Inclui cache com TTL e limpeza automática.
     """
-    
+
     def __init__(self, exchange):
         self.exchange = exchange
         self.cache = {}
         self.cache_ttl = 60  # seconds
+        self._last_cleanup = datetime.now()
+        self._cleanup_interval = 300  # Limpar cache a cada 5 minutos
+
+    def _cleanup_cache(self):
+        """Remove entradas expiradas do cache."""
+        now = datetime.now()
+
+        # Só limpar a cada _cleanup_interval segundos
+        if (now - self._last_cleanup).total_seconds() < self._cleanup_interval:
+            return
+
+        self._last_cleanup = now
+        expired_keys = []
+
+        for key, (cached_time, _) in self.cache.items():
+            age = (now - cached_time).total_seconds()
+            if age > self.cache_ttl * 10:  # Remover após 10x o TTL
+                expired_keys.append(key)
+
+        for key in expired_keys:
+            del self.cache[key]
+
+        if expired_keys:
+            logger.debug(f"Cache cleanup: {len(expired_keys)} entradas removidas")
     
     def fetch_ohlcv(
         self,
@@ -38,8 +71,11 @@ class MarketData:
         Returns:
             DataFrame with OHLCV data
         """
+        # Limpeza periódica do cache
+        self._cleanup_cache()
+
         cache_key = f"{symbol}_{timeframe}_{limit}"
-        
+
         # Check cache
         if use_cache and cache_key in self.cache:
             cached_time, cached_data = self.cache[cache_key]
@@ -181,7 +217,8 @@ class MarketData:
         try:
             ticker = self.exchange.fetch_ticker(symbol)
             return float(ticker.get('last', 0))
-        except:
+        except Exception as e:
+            logging.debug(f"Erro ao obter preço de {symbol}: {e}")
             return 0.0
     
     def get_orderbook(self, symbol: str, limit: int = 10) -> Dict[str, Any]:
@@ -193,7 +230,8 @@ class MarketData:
                 'asks': ob.get('asks', [])[:limit],
                 'spread': (ob['asks'][0][0] - ob['bids'][0][0]) if ob['asks'] and ob['bids'] else 0
             }
-        except:
+        except Exception as e:
+            logging.debug(f"Erro ao obter orderbook de {symbol}: {e}")
             return {'bids': [], 'asks': [], 'spread': 0}
 
 

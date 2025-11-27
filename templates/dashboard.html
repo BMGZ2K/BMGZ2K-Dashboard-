@@ -812,6 +812,17 @@
         let statusCacheTime = 0;
         const STATUS_CACHE_TTL = 0; // Sem cache local, usar sempre do backend
 
+        // ===== FUNÇÕES DE SEGURANÇA (Anti-XSS) =====
+        function escapeHtml(str) {
+            if (str === null || str === undefined) return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
         // ===== FUNÇÕES DE FORMATAÇÃO =====
         function formatCurrency(value) {
             return new Intl.NumberFormat('en-US', {
@@ -1067,7 +1078,7 @@
 
             const fundingEl = document.getElementById('total-funding');
             const totalFunding = data.total_funding || 0;
-            fundingEl.textContent = (totalFunding >= 0 ? '+' : '') + formatCurrency(totalFunding);
+            fundingEl.textContent = formatCurrency(totalFunding);
             fundingEl.style.color = totalFunding >= 0 ? '#10b981' : '#ef4444';
 
             // Margem Disponível
@@ -1182,10 +1193,10 @@
                 const robustnessBg = robustnessColor + '20';
                 const returnColor = (s.avg_return || 0) >= 0 ? '#10b981' : '#ef4444';
 
-                return '<div class="strategy-card' + (s.is_active ? ' active' : '') + '" onclick="showStrategyDetail(\'' + s.id + '\')">' +
+                return '<div class="strategy-card' + (s.is_active ? ' active' : '') + '" onclick="showStrategyDetail(\'' + escapeHtml(s.id) + '\')">' +
                     '<div class="strategy-header">' +
                         '<div>' +
-                            '<span class="strategy-name">' + (s.name || s.strategy_type) + '</span>' +
+                            '<span class="strategy-name">' + escapeHtml(s.name || s.strategy_type) + '</span>' +
                             (s.is_active ? '<span class="active-badge" style="margin-left: 10px;">ATIVA</span>' : '') +
                         '</div>' +
                         '<div style="display: flex; gap: 10px; align-items: center;">' +
@@ -1470,7 +1481,7 @@
                         <td style="color: ${pnlColor}; font-weight: 600;">${formatCurrency(t.pnl)}</td>
                         <td style="font-size: 11px;">
                             <div style="color: #ef4444;">C: -${formatCurrency(commission)}</div>
-                            <div style="color: ${fundingColor};">F: ${funding >= 0 ? '+' : ''}${formatCurrency(funding)}</div>
+                            <div style="color: ${fundingColor};">F: ${formatCurrency(funding)}</div>
                         </td>
                         <td style="color: ${pnlColor};">${(t.pnl_pct || 0).toFixed(2)}%</td>
                         <td style="font-size: 11px; max-width: 150px; overflow: hidden; text-overflow: ellipsis;">${t.reason_entry || '-'}</td>

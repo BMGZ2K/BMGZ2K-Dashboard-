@@ -8,24 +8,36 @@ __pycache__/
 *.pyo
 *.egg-info/
 venv/
+.venv/
 
 # Logs
 *.log
 logs/
 
-# Models & Data
+# Data & State (sensitive/generated)
 *.pkl
 *.csv
 models/
 state/
 results/
 
-# Scripts auxiliares (análises, validações, otimizações antigas)
-scripts/
+# Archive (old code, not needed in repo)
+archive/
+
+# Tests
+tests/
 
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
 
 # System
 nul
+.DS_Store
+Thumbs.db
+
+# Temporary
+*.tmp
+*.bak
