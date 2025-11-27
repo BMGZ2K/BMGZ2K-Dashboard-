@@ -28,7 +28,8 @@ load_dotenv()
 
 from core.config import (
     API_KEY, SECRET_KEY, SYMBOLS,
-    get_backtest_config, get_wfo_config, get_validated_params
+    get_backtest_config, get_wfo_config, get_validated_params,
+    VALIDATION_THRESHOLDS
 )
 from core.signals import SignalGenerator
 from core.scoring import ScoringSystem, SignalScore
@@ -871,12 +872,46 @@ class PortfolioBacktester:
                 # Agregar resultados dos folds
                 avg_return = np.mean([r.total_return_pct for r in fold_results])
                 avg_sharpe = np.mean([r.sharpe_ratio for r in fold_results])
+                avg_sortino = np.mean([r.sortino_ratio for r in fold_results])
+                avg_profit_factor = np.mean([r.profit_factor for r in fold_results])
                 max_dd = max([r.max_drawdown_pct for r in fold_results])
                 avg_winrate = np.mean([r.win_rate for r in fold_results])
                 total_trades = sum([r.total_trades for r in fold_results])
 
-                # Score composto
-                score = avg_sharpe * 2 + avg_return / 10 - max_dd / 5 + avg_winrate / 20
+                # === SCORE WFO MELHORADO ===
+                # Considera consistência entre folds (desvio padrão)
+                std_return = np.std([r.total_return_pct for r in fold_results])
+                std_sharpe = np.std([r.sharpe_ratio for r in fold_results])
+
+                # Contagem de folds positivos (robustez)
+                positive_folds = sum(1 for r in fold_results if r.total_return_pct > 0)
+                fold_consistency = positive_folds / len(fold_results) if fold_results else 0
+
+                # Score composto com pesos balanceados:
+                # - Sharpe: principal métrica de risco-retorno (peso 25%)
+                # - Sortino: penaliza apenas downside (peso 20%)
+                # - Profit Factor: qualidade dos trades (peso 15%)
+                # - Retorno: performance absoluta (peso 15%)
+                # - Win Rate: consistência (peso 10%)
+                # - Consistência entre folds: robustez WFO (peso 15%)
+                # - Penalização: drawdown e variabilidade
+
+                score = (
+                    avg_sharpe * 2.5 +                    # Sharpe (25%)
+                    avg_sortino * 2.0 +                   # Sortino (20%)
+                    avg_profit_factor * 1.5 +             # Profit Factor (15%)
+                    avg_return / 8 +                      # Retorno (15%)
+                    avg_winrate / 10 +                    # Win Rate (10%)
+                    fold_consistency * 3.0 -              # Consistência (15%)
+                    max_dd / 4 -                          # Penaliza drawdown
+                    std_sharpe * 0.5                      # Penaliza variabilidade
+                )
+
+                # Bonus por trades suficientes (confiabilidade estatística)
+                if total_trades >= 50:
+                    score += 1.0
+                elif total_trades < 20:
+                    score -= 2.0  # Penaliza poucos trades
 
                 # Converter fold_results para dicionários com detalhes
                 fold_details = []
@@ -901,12 +936,16 @@ class PortfolioBacktester:
                     'params': params,
                     'avg_return': avg_return,
                     'avg_sharpe': avg_sharpe,
+                    'avg_sortino': avg_sortino,
+                    'avg_profit_factor': avg_profit_factor,
                     'max_dd': max_dd,
                     'avg_winrate': avg_winrate,
                     'total_trades': total_trades,
+                    'fold_consistency': fold_consistency,
+                    'std_sharpe': std_sharpe,
                     'score': score,
                     'fold_results': fold_results,
-                    'fold_details': fold_details  # Detalhes para armazenamento
+                    'fold_details': fold_details
                 })
             
             if (i + 1) % 10 == 0:
@@ -927,26 +966,43 @@ class PortfolioBacktester:
         print(f"\nMétricas médias:")
         print(f"  Retorno: {best['avg_return']:.2f}%")
         print(f"  Sharpe: {best['avg_sharpe']:.2f}")
+        print(f"  Sortino: {best['avg_sortino']:.2f}")
+        print(f"  Profit Factor: {best['avg_profit_factor']:.2f}")
         print(f"  Max DD: {best['max_dd']:.2f}%")
         print(f"  Win Rate: {best['avg_winrate']:.1f}%")
         print(f"  Total Trades: {best['total_trades']}")
-        print(f"  Score: {best['score']:.2f}")
-        
+        print(f"  Fold Consistency: {best['fold_consistency']*100:.0f}%")
+        print(f"  Score WFO: {best['score']:.2f}")
+
         # Preparar detalhes dos folds para armazenamento
         fold_details = best.get('fold_details', [])
+
+        # === VALIDAÇÃO CONTRA THRESHOLDS ===
+        validation = self._validate_against_thresholds(best)
+        if validation['passed']:
+            print(f"\n[OK] Estratégia PASSOU em todos os critérios de validação!")
+        else:
+            print(f"\n[AVISO] Estratégia não passou em alguns critérios:")
+            for failure in validation['failures']:
+                print(f"  - {failure}")
 
         return {
             'best_params': best['params'],
             'metrics': {
-                'avg_return': best['avg_return'],
-                'avg_sharpe': best['avg_sharpe'],
-                'max_dd': best['max_dd'],
-                'avg_winrate': best['avg_winrate'],
+                'avg_return': round(best['avg_return'], 2),
+                'avg_sharpe': round(best['avg_sharpe'], 2),
+                'avg_sortino': round(best['avg_sortino'], 2),
+                'avg_profit_factor': round(best['avg_profit_factor'], 2),
+                'max_dd': round(best['max_dd'], 2),
+                'avg_winrate': round(best['avg_winrate'], 1),
                 'total_trades': best['total_trades'],
-                'score': best['score']
+                'fold_consistency': round(best['fold_consistency'], 2),
+                'std_sharpe': round(best['std_sharpe'], 2),
+                'score': round(best['score'], 2)
             },
-            'fold_details': fold_details,  # Detalhes de cada fold
-            'all_results': results[:10],  # Top 10
+            'validation': validation,
+            'fold_details': fold_details,
+            'all_results': results[:10],
             'num_folds': len(folds),
             'symbols': symbols,
             'timeframe': config['timeframe'],
@@ -956,27 +1012,94 @@ class PortfolioBacktester:
             }
         }
 
+    def _validate_against_thresholds(self, result: Dict) -> Dict:
+        """
+        Validar resultados contra thresholds definidos em config.py.
+
+        Thresholds usados:
+        - min_sharpe: Sharpe ratio mínimo
+        - min_sortino: Sortino ratio mínimo
+        - min_profit_factor: Profit factor mínimo
+        - min_win_rate: Win rate mínimo (%)
+        - max_drawdown: Drawdown máximo (%)
+        - min_trades: Número mínimo de trades
+
+        Returns:
+            Dict com 'passed' (bool) e 'failures' (list)
+        """
+        failures = []
+
+        # Sharpe
+        if result['avg_sharpe'] < VALIDATION_THRESHOLDS.get('min_sharpe', 1.0):
+            failures.append(
+                f"Sharpe {result['avg_sharpe']:.2f} < min {VALIDATION_THRESHOLDS['min_sharpe']}"
+            )
+
+        # Sortino
+        if result['avg_sortino'] < VALIDATION_THRESHOLDS.get('min_sortino', 1.2):
+            failures.append(
+                f"Sortino {result['avg_sortino']:.2f} < min {VALIDATION_THRESHOLDS['min_sortino']}"
+            )
+
+        # Profit Factor
+        if result['avg_profit_factor'] < VALIDATION_THRESHOLDS.get('min_profit_factor', 1.3):
+            failures.append(
+                f"Profit Factor {result['avg_profit_factor']:.2f} < min {VALIDATION_THRESHOLDS['min_profit_factor']}"
+            )
+
+        # Win Rate
+        if result['avg_winrate'] < VALIDATION_THRESHOLDS.get('min_win_rate', 0.40) * 100:
+            failures.append(
+                f"Win Rate {result['avg_winrate']:.1f}% < min {VALIDATION_THRESHOLDS['min_win_rate']*100}%"
+            )
+
+        # Max Drawdown
+        if result['max_dd'] > VALIDATION_THRESHOLDS.get('max_drawdown', 0.25) * 100:
+            failures.append(
+                f"Max DD {result['max_dd']:.1f}% > max {VALIDATION_THRESHOLDS['max_drawdown']*100}%"
+            )
+
+        # Min Trades
+        if result['total_trades'] < VALIDATION_THRESHOLDS.get('min_trades', 50):
+            failures.append(
+                f"Trades {result['total_trades']} < min {VALIDATION_THRESHOLDS['min_trades']}"
+            )
+
+        # Fold Consistency (critério adicional para WFO)
+        if result.get('fold_consistency', 0) < 0.6:  # 60% dos folds positivos
+            failures.append(
+                f"Fold Consistency {result['fold_consistency']*100:.0f}% < min 60%"
+            )
+
+        return {
+            'passed': len(failures) == 0,
+            'failures': failures,
+            'thresholds_used': VALIDATION_THRESHOLDS
+        }
+
 
 def main():
     """Executar WFO de portfolio."""
     print("\n" + "=" * 60)
     print("INICIANDO PORTFOLIO WFO BACKTEST")
     print("=" * 60)
-    
+
     # Configuração
     symbols = SYMBOLS[:15]  # Top 15 símbolos
     end_date = datetime.now()
     start_date = end_date - timedelta(days=180)  # 6 meses
-    
+
     # Grid de parâmetros a testar
+    # NOTA: Usar nomes padronizados conforme config.py
     param_grid = {
-        'strategy': ['stoch_extreme', 'rsi_extreme', 'momentum_burst'],
-        'sl_mult': [1.5, 2.0, 2.5],
-        'tp_mult': [2.0, 3.0, 4.0],
+        'strategy': ['stoch_extreme', 'rsi_extremes', 'momentum_burst', 'trend_following'],
+        'sl_atr_mult': [2.0, 2.5, 3.0, 3.5],    # Padronizado (era sl_mult)
+        'tp_atr_mult': [3.0, 4.0, 5.0, 6.0],    # Padronizado (era tp_mult)
         'rsi_oversold': [20, 25, 30],
         'rsi_overbought': [70, 75, 80],
-        'max_positions': [5, 8, 10],
-        'max_margin_usage': [0.7, 0.8, 0.9],
+        'adx_min': [18, 20, 25],                 # Adicionado para filtro de tendência
+        'max_positions': [8, 10, 12],
+        'max_margin_usage': [0.7, 0.8],
     }
     
     # Executar WFO

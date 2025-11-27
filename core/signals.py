@@ -15,13 +15,8 @@ from dataclasses import dataclass
 # Importar parâmetros centralizados
 from .config import WFO_VALIDATED_PARAMS, get_param
 
-# Importar estratégias otimizadas (compatibilidade)
-try:
-    from core.strategies_optimized import OptimizedStrategies, OPTIMIZED_PARAMS
-    HAS_OPTIMIZED = True
-except ImportError:
-    HAS_OPTIMIZED = False
-    OPTIMIZED_PARAMS = {}
+# Flag para estratégias otimizadas (import tardio para evitar circular)
+HAS_OPTIMIZED = True  # Será validado no __init__
 
 
 @dataclass
@@ -197,10 +192,13 @@ class SignalGenerator:
         self.stoch_base_strength = self.params.get('stoch_base_strength', 6.0)
         self.adx_aggressive = self.params.get('adx_aggressive', 30)
 
-        # Inicializar estratégias otimizadas se disponíveis
+        # Inicializar estratégias otimizadas (import tardio para evitar circular)
         self._optimized_strategies = None
-        if HAS_OPTIMIZED:
+        try:
+            from .strategies_optimized import OptimizedStrategies
             self._optimized_strategies = OptimizedStrategies(self.params)
+        except ImportError:
+            pass  # Estratégias otimizadas não disponíveis
 
         # Exit signal params
         self.rsi_exit_long = self.params.get('rsi_exit_long', 70)
