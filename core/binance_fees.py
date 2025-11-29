@@ -22,6 +22,14 @@ from datetime import datetime, timedelta
 import json
 import os
 import time
+import hmac
+import hashlib
+import logging
+from urllib.parse import urlencode
+
+from .config import Config
+
+logger = logging.getLogger(__name__)
 
 # Cache para evitar chamadas excessivas à API
 _cache = {}
@@ -110,8 +118,12 @@ class BinanceFees:
             api_secret: API secret (opcional)
         """
         self.base_url = self.TESTNET_URL if use_testnet else self.BASE_URL
-        self.api_key = api_key
-        self.api_secret = api_secret
+        self.use_testnet = use_testnet
+
+        # Carregar API keys de variáveis de ambiente se não fornecidas
+        self.api_key = api_key or os.environ.get('BINANCE_API_KEY') or os.environ.get('BINANCE_TESTNET_API_KEY')
+        self.api_secret = api_secret or os.environ.get('BINANCE_API_SECRET') or os.environ.get('BINANCE_TESTNET_API_SECRET')
+
         self.session = requests.Session()
 
         # Cache local
@@ -120,6 +132,73 @@ class BinanceFees:
         self._commission_cache: Dict[str, CommissionRates] = {}
         self._exchange_info = None
         self._last_exchange_info_update = None
+
+    def _generate_signature(self, params: Dict) -> str:
+        """
+        Gerar assinatura HMAC SHA256 para requests autenticados.
+
+        Args:
+            params: Parâmetros do request
+
+        Returns:
+            Assinatura hexadecimal
+        """
+        if not self.api_secret:
+            return ""
+
+        query_string = urlencode(params)
+        signature = hmac.new(
+            self.api_secret.encode('utf-8'),
+            query_string.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        return signature
+
+    def _signed_request(self, method: str, endpoint: str, params: Dict = None) -> Optional[Dict]:
+        """
+        Fazer request autenticado com assinatura.
+
+        Args:
+            method: 'GET' ou 'POST'
+            endpoint: Endpoint da API (ex: '/fapi/v1/commissionRate')
+            params: Parâmetros adicionais
+
+        Returns:
+            Resposta JSON ou None em caso de erro
+        """
+        if not self.api_key or not self.api_secret:
+            logger.debug("API keys não configuradas, usando taxas padrão")
+            return None
+
+        params = params or {}
+        params['timestamp'] = int(time.time() * 1000)
+        params['signature'] = self._generate_signature(params)
+
+        headers = {'X-MBX-APIKEY': self.api_key}
+        url = f"{self.base_url}{endpoint}"
+
+        # Usar timeout do config
+        http_timeout = Config.get('exchange.http_timeout', 10)
+
+        try:
+            if method.upper() == 'GET':
+                response = self.session.get(url, params=params, headers=headers, timeout=http_timeout)
+            else:
+                response = self.session.post(url, data=params, headers=headers, timeout=http_timeout)
+
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as e:
+            if response.status_code == 401:
+                logger.warning("Autenticação falhou - verificar API keys")
+            elif response.status_code == 403:
+                logger.warning("Acesso negado - API key pode não ter permissão")
+            else:
+                logger.warning(f"Erro HTTP na request autenticada: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Erro na request autenticada: {e}")
+            return None
 
     def _get_cached(self, key: str, fetch_func, ttl: int = CACHE_DURATION):
         """Obter valor do cache ou buscar novo."""
@@ -145,7 +224,7 @@ class BinanceFees:
                 response.raise_for_status()
                 return response.json()
             except Exception as e:
-                print(f"Erro ao buscar exchange info: {e}")
+                logger.warning(f"Erro ao buscar exchange info: {e}")
                 return None
 
         return self._get_cached("exchange_info", fetch, ttl=3600)  # 1 hora
@@ -230,7 +309,7 @@ class BinanceFees:
                     )
                 return result
             except Exception as e:
-                print(f"Erro ao buscar funding rates: {e}")
+                logger.warning(f"Erro ao buscar funding rates: {e}")
                 return {}
 
         return self._get_cached("all_funding_rates", fetch, ttl=60)  # 1 minuto
@@ -294,7 +373,7 @@ class BinanceFees:
                 for item in data
             ]
         except Exception as e:
-            print(f"Erro ao buscar histórico de funding: {e}")
+            logger.warning(f"Erro ao buscar histórico de funding: {e}")
             return []
 
     def get_average_funding_rate(self, symbol: str, days: int = 30, use_current_as_estimate: bool = True) -> float:
@@ -341,24 +420,49 @@ class BinanceFees:
 
     def get_commission_rates(self, symbol: str = "BTCUSDT") -> CommissionRates:
         """
-        Obter taxas de comissão.
+        Obter taxas de comissão da API (autenticado).
 
-        Nota: Endpoint /fapi/v1/commissionRate requer autenticação.
-        Sem autenticação, retorna taxas padrão VIP0.
+        Endpoint: GET /fapi/v1/commissionRate (requer autenticação)
+        Documentação: https://developers.binance.com/docs/derivatives/usds-margined-futures/account/rest-api/User-Commission-Rate
 
         Args:
-            symbol: Par de trading
+            symbol: Par de trading (ex: BTCUSDT)
 
         Returns:
-            CommissionRates com maker/taker fees
+            CommissionRates com maker/taker fees personalizadas do usuário
         """
-        # TODO: Implementar autenticação para obter taxas personalizadas
-        # Por enquanto, retorna taxas padrão VIP0
-        return CommissionRates(
-            symbol=symbol,
-            maker_rate=self.DEFAULT_MAKER_FEE,
-            taker_rate=self.DEFAULT_TAKER_FEE
-        )
+        # Verificar cache primeiro
+        if symbol in self._commission_cache:
+            return self._commission_cache[symbol]
+
+        def fetch_from_api():
+            # Tentar buscar da API autenticada
+            data = self._signed_request('GET', '/fapi/v1/commissionRate', {'symbol': symbol})
+
+            if data:
+                maker_rate = float(data.get('makerCommissionRate', self.DEFAULT_MAKER_FEE))
+                taker_rate = float(data.get('takerCommissionRate', self.DEFAULT_TAKER_FEE))
+                logger.info(f"Taxas obtidas da API para {symbol}: maker={maker_rate*100:.4f}%, taker={taker_rate*100:.4f}%")
+                return CommissionRates(
+                    symbol=symbol,
+                    maker_rate=maker_rate,
+                    taker_rate=taker_rate
+                )
+            else:
+                # Fallback para taxas padrão se API falhar
+                logger.debug(f"Usando taxas padrão para {symbol} (API não disponível)")
+                return CommissionRates(
+                    symbol=symbol,
+                    maker_rate=self.DEFAULT_MAKER_FEE,
+                    taker_rate=self.DEFAULT_TAKER_FEE
+                )
+
+        cache_key = f"commission_{symbol}"
+        result = self._get_cached(cache_key, fetch_from_api, ttl=3600)  # Cache 1 hora
+
+        # Armazenar no cache local também
+        self._commission_cache[symbol] = result
+        return result
 
     def get_mark_price(self, symbol: str) -> float:
         """

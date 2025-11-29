@@ -13,19 +13,21 @@ import os
 import json
 import time
 import logging
+import threading
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from flask import Flask, render_template, jsonify
+from flask import Flask, render_template, jsonify, request
 import ccxt
 
 from core.config import (
     API_KEY, SECRET_KEY, USE_TESTNET, SYMBOLS, PRIMARY_TIMEFRAME,
-    LEVERAGE_CAP, get_wfo_config
+    LEVERAGE_CAP, get_wfo_config, Config
 )
 from core.evolution import get_storage
 from core.utils import load_json_safe
+from core.error_handling import get_health_status, get_all_circuit_breakers
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -35,10 +37,13 @@ app = Flask(__name__)
 app.config['TEMPLATES_AUTO_RELOAD'] = True
 
 # =============================================================================
-# CACHE UNIFICADO - Todos os dados sincronizados
+# CACHE UNIFICADO - Todos os dados sincronizados (THREAD-SAFE)
 # =============================================================================
-# TTL padrão para todos os caches (garante consistência)
-UNIFIED_CACHE_TTL = 2.0  # 2 segundos
+# TTL padrão para todos os caches (do config)
+UNIFIED_CACHE_TTL = Config.get('timeouts.dashboard_cache_ttl', 1.0)
+
+# Lock global para thread-safety dos caches
+_cache_lock = threading.Lock()
 
 # Cache de estado local (para evitar leituras repetidas de arquivo)
 _trader_state_cache = {
@@ -51,7 +56,7 @@ _exchange_cache = {
     'instance': None,
     'timestamp': 0
 }
-EXCHANGE_CACHE_TTL = 60  # 60 segundos - conexão é estável
+EXCHANGE_CACHE_TTL = Config.get('timeouts.exchange_cache_ttl', 60)
 
 # Cache de dados da Binance - UNIFICADO para garantir consistência
 # Todos os endpoints usam os mesmos dados quando dentro do TTL
@@ -63,40 +68,45 @@ _binance_data_cache = {
 
 
 def get_cached_account():
-    """Retorna dados da conta com cache."""
+    """Retorna dados da conta com cache (thread-safe, sem race condition)."""
     global _binance_data_cache
     now = time.time()
-    cache = _binance_data_cache['account']
 
-    # Usar cache se ainda válido
-    if cache['data'] and (now - cache['timestamp']) < UNIFIED_CACHE_TTL:
-        return cache['data']
+    with _cache_lock:
+        cache = _binance_data_cache['account']
 
-    try:
-        exchange = get_exchange()
-        account = exchange.fapiPrivateV2GetAccount()
-        cache['data'] = account
-        cache['timestamp'] = now
-        _binance_data_cache['last_sync'] = now
-        return account
-    except Exception as e:
-        logger.error(f"Erro ao buscar conta: {e}")
-        return cache['data']  # Retorna cache antigo se falhar
+        # Usar cache se ainda válido
+        if cache['data'] and (now - cache['timestamp']) < UNIFIED_CACHE_TTL:
+            return cache['data']
+
+        # Buscar DENTRO do lock para evitar double-fetch (race condition fix)
+        try:
+            exchange = get_exchange()
+            account = exchange.fapiPrivateV2GetAccount()
+            _binance_data_cache['account']['data'] = account
+            _binance_data_cache['account']['timestamp'] = now
+            _binance_data_cache['last_sync'] = now
+            return account
+        except Exception as e:
+            logger.error(f"Erro ao buscar conta: {e}")
+            return cache['data']  # Retorna cache antigo se falhar
 
 
 def get_cached_tickers():
     """
-    Retorna tickers/preços com cache.
+    Retorna tickers/preços com cache (thread-safe).
     Usa fapiPublicGetPremiumIndex que é muito mais rápido que fetch_tickers.
     """
     global _binance_data_cache
     now = time.time()
-    cache = _binance_data_cache['tickers']
 
-    # Usar cache se ainda válido
-    if cache['data'] and (now - cache['timestamp']) < UNIFIED_CACHE_TTL:
-        return cache['data']
+    with _cache_lock:
+        cache = _binance_data_cache['tickers']
+        # Usar cache se ainda válido
+        if cache['data'] and (now - cache['timestamp']) < UNIFIED_CACHE_TTL:
+            return cache['data']
 
+    # Buscar fora do lock para não bloquear outras threads
     try:
         exchange = get_exchange()
 
@@ -111,12 +121,14 @@ def get_cached_tickers():
             if mark_price > 0:
                 tickers[sym] = {'last': mark_price, 'symbol': sym}
 
-        cache['data'] = tickers
-        cache['timestamp'] = now
+        with _cache_lock:
+            _binance_data_cache['tickers']['data'] = tickers
+            _binance_data_cache['tickers']['timestamp'] = now
         return tickers
     except Exception as e:
         logger.error(f"Erro ao buscar tickers: {e}")
-        return cache['data'] or {}
+        with _cache_lock:
+            return _binance_data_cache['tickers']['data'] or {}
 
 
 def get_exchange():
@@ -128,14 +140,20 @@ def get_exchange():
     if _exchange_cache['instance'] and (now - _exchange_cache['timestamp']) < EXCHANGE_CACHE_TTL:
         return _exchange_cache['instance']
 
+    # Carregar configurações do exchange do config
+    recv_window = Config.get('exchange.recv_window', 60000)
+    enable_rate_limit = Config.get('exchange.enable_rate_limit', True)
+    adjust_time_diff = Config.get('exchange.adjust_for_time_diff', True)
+    default_type = Config.get('exchange.default_type', 'future')
+
     exchange = ccxt.binance({
         'apiKey': API_KEY,
         'secret': SECRET_KEY,
-        'enableRateLimit': True,
+        'enableRateLimit': enable_rate_limit,
         'options': {
-            'defaultType': 'future',
-            'adjustForTimeDifference': True,
-            'recvWindow': 60000,
+            'defaultType': default_type,
+            'adjustForTimeDifference': adjust_time_diff,
+            'recvWindow': recv_window,
         }
     })
     if USE_TESTNET:
@@ -156,19 +174,64 @@ def get_exchange():
 
 
 def get_trader_state_cached():
-    """Retorna trader_state com cache unificado."""
+    """Retorna trader_state com cache unificado (thread-safe)."""
     global _trader_state_cache
     now = time.time()
-    if now - _trader_state_cache['timestamp'] > UNIFIED_CACHE_TTL:
-        _trader_state_cache['data'] = load_json_safe('state/trader_state.json')
-        _trader_state_cache['timestamp'] = now
-    return _trader_state_cache['data']
+
+    with _cache_lock:
+        if now - _trader_state_cache['timestamp'] > UNIFIED_CACHE_TTL:
+            _trader_state_cache['data'] = load_json_safe('state/trader_state.json')
+            _trader_state_cache['timestamp'] = now
+        return _trader_state_cache['data']
 
 
 @app.route('/')
 def index():
     """Pagina principal."""
     return render_template('dashboard.html')
+
+
+@app.route('/api/health')
+def api_health():
+    """
+    Health check endpoint - Status dos circuit breakers e sistema.
+
+    Retorna:
+        - status: 'healthy' ou 'degraded'
+        - circuit_breakers: estado de cada circuit breaker
+        - timestamp: momento da verificacao
+        - bot_running: se o bot esta rodando (via lock file)
+    """
+    try:
+        # Obter status dos circuit breakers
+        health = get_health_status()
+
+        # Verificar se bot esta rodando (via lock file)
+        bot_lock_file = 'state/bot.lock'
+        bot_running = os.path.exists(bot_lock_file)
+
+        if bot_running:
+            try:
+                with open(bot_lock_file, 'r') as f:
+                    bot_pid = f.read().strip()
+                health['bot_pid'] = bot_pid
+            except Exception:
+                pass
+
+        health['bot_running'] = bot_running
+
+        # Uptime do dashboard (aproximado)
+        health['dashboard_uptime'] = time.time() - app.config.get('start_time', time.time())
+
+        return jsonify(health)
+
+    except Exception as e:
+        logger.error(f"Erro em /api/health: {e}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e),
+            'timestamp': datetime.now().isoformat()
+        }), 500
 
 
 @app.route('/api/status')
@@ -245,12 +308,16 @@ def api_status():
         # Timestamp de sincronização do cache (quando os dados foram buscados da Binance)
         sync_time = _binance_data_cache.get('last_sync', time.time())
 
+        # Obter status do Kelly Criterion
+        use_kelly = Config.get('trader.use_kelly_sizing', False)
+
         return jsonify({
             'timestamp': datetime.now().isoformat(),
             'data_sync_time': datetime.fromtimestamp(sync_time).isoformat(),
             'mode': 'TESTNET' if USE_TESTNET else 'PRODUCTION',
             'timeframe': PRIMARY_TIMEFRAME,
-            'symbols_count': len(SYMBOLS),
+            'symbols_count': len(Config.get('symbols', SYMBOLS)),
+            'use_kelly': use_kelly,
             # Balances
             'wallet_balance': round(wallet_balance, 2),
             'margin_balance': round(margin_balance, 2),
@@ -365,8 +432,8 @@ def api_positions():
                 'take_profit': round(tp, 6),
                 'sl_distance': round(sl_distance, 2),
                 'tp_distance': round(tp_distance, 2),
-                'unrealized_pnl': round(pnl, 2),
-                'pnl_pct': round(pnl_pct, 2),
+                'unrealized_pnl': round(pnl, 3),
+                'pnl_pct': round(pnl_pct, 3),
                 'leverage': leverage,
                 'liquidation_price': round(liq_price, 6),
                 'entry_time': local.get('entry_time', ''),
@@ -377,7 +444,7 @@ def api_positions():
 
         return jsonify({
             'count': len(positions),
-            'total_unrealized_pnl': round(total_unrealized_pnl, 2),
+            'total_unrealized_pnl': round(total_unrealized_pnl, 3),
             'positions': positions,
             'data_sync_time': datetime.fromtimestamp(sync_time).isoformat(),
         })
@@ -540,24 +607,36 @@ def api_strategy_detail(strategy_id):
 
 @app.route('/api/trades')
 def api_trades():
-    """Historico de trades."""
+    """Historico de trades com paginação."""
     trader = get_trader_state_cached()
     stats = trader.get('stats', {})
-    
+
+    # Parâmetros de paginação
+    page = request.args.get('page', 1, type=int)
+    limit = request.args.get('limit', 50, type=int)
+    limit = min(limit, 200)  # Máximo 200 por página
+
     # Ler historico de trades JSON
-    trades = []
+    all_trades = []
     try:
         if os.path.exists('state/trade_history.json'):
             with open('state/trade_history.json', 'r') as f:
-                trades = json.load(f)
-                trades = trades[-50:]  # Ultimos 50
-                trades.reverse()  # Mais recentes primeiro
+                all_trades = json.load(f)
     except Exception as e:
-        log.warning(f"Erro ao carregar trade_history.json: {e}")
-    
-    # Calcular estatisticas por estrategia
+        logger.warning(f"Erro ao carregar trade_history.json: {e}")
+
+    total_trades = len(all_trades)
+    total_pages = (total_trades + limit - 1) // limit if total_trades > 0 else 1
+
+    # Paginação (mais recentes primeiro)
+    all_trades.reverse()
+    start_idx = (page - 1) * limit
+    end_idx = start_idx + limit
+    trades = all_trades[start_idx:end_idx]
+
+    # Calcular estatisticas por estrategia (sobre todos os trades)
     strategy_stats = {}
-    for t in trades:
+    for t in all_trades:
         strat = t.get('strategy', 'unknown')
         if strat not in strategy_stats:
             strategy_stats[strat] = {'trades': 0, 'wins': 0, 'pnl': 0}
@@ -565,15 +644,23 @@ def api_trades():
         strategy_stats[strat]['pnl'] += t.get('pnl', 0)
         if t.get('pnl', 0) > 0:
             strategy_stats[strat]['wins'] += 1
-    
+
     # Calcular win rate por estrategia
     for strat, data in strategy_stats.items():
         data['win_rate'] = (data['wins'] / data['trades'] * 100) if data['trades'] > 0 else 0
-    
+
     return jsonify({
         'stats': stats,
         'recent_trades': trades,
-        'strategy_stats': strategy_stats
+        'strategy_stats': strategy_stats,
+        'pagination': {
+            'page': page,
+            'limit': limit,
+            'total_trades': total_trades,
+            'total_pages': total_pages,
+            'has_next': page < total_pages,
+            'has_prev': page > 1
+        }
     })
 
 
@@ -587,9 +674,331 @@ def api_logs():
                 lines = f.readlines()
                 logs = [l.strip() for l in lines[-100:]]
     except Exception as e:
-        log.warning(f"Erro ao ler logs/bot.log: {e}")
+        logger.warning(f"Erro ao ler logs/bot.log: {e}")
 
     return jsonify({'logs': logs})
+
+
+@app.route('/api/equity-history')
+def api_equity_history():
+    """
+    Historico de equity (balance) ao longo do tempo.
+    Reconstroi a curva de equity a partir do trade_history.
+    """
+    try:
+        # Carregar trade history
+        trade_history = load_json_safe('state/trade_history.json')
+        if not isinstance(trade_history, list):
+            trade_history = []
+
+        # Carregar balance inicial do trader_state
+        trader = get_trader_state_cached()
+        initial_balance = trader.get('initial_balance', 10000)
+
+        # Se nao houver trades, retornar apenas o ponto inicial
+        if len(trade_history) == 0:
+            now = datetime.now().isoformat()
+            return jsonify({
+                'equity_curve': [{'timestamp': now, 'equity': initial_balance, 'drawdown': 0}],
+                'initial_balance': initial_balance,
+                'current_balance': initial_balance,
+                'max_drawdown': 0,
+                'total_return_pct': 0
+            })
+
+        # Ordenar trades por exit_time
+        sorted_trades = sorted(trade_history, key=lambda x: x.get('exit_time', ''))
+
+        # Construir curva de equity
+        equity_curve = []
+        running_balance = initial_balance
+        high_water_mark = initial_balance
+        max_drawdown = 0
+
+        # Ponto inicial
+        first_trade_time = sorted_trades[0].get('exit_time', datetime.now().isoformat())
+        equity_curve.append({
+            'timestamp': first_trade_time,
+            'equity': initial_balance,
+            'drawdown': 0,
+            'trade_id': 0
+        })
+
+        # Adicionar cada trade
+        for i, trade in enumerate(sorted_trades):
+            pnl = trade.get('pnl', 0)
+            running_balance += pnl
+            high_water_mark = max(high_water_mark, running_balance)
+
+            # Calcular drawdown atual
+            if high_water_mark > 0:
+                current_dd = (high_water_mark - running_balance) / high_water_mark * 100
+            else:
+                current_dd = 0
+
+            max_drawdown = max(max_drawdown, current_dd)
+
+            equity_curve.append({
+                'timestamp': trade.get('exit_time', ''),
+                'equity': round(running_balance, 2),
+                'drawdown': round(current_dd, 2),
+                'trade_id': trade.get('id', i + 1),
+                'symbol': trade.get('symbol', ''),
+                'pnl': round(pnl, 2)
+            })
+
+        # Calcular retorno total
+        total_return_pct = ((running_balance - initial_balance) / initial_balance * 100) if initial_balance > 0 else 0
+
+        return jsonify({
+            'equity_curve': equity_curve,
+            'initial_balance': initial_balance,
+            'current_balance': round(running_balance, 2),
+            'high_water_mark': round(high_water_mark, 2),
+            'max_drawdown': round(max_drawdown, 2),
+            'total_return_pct': round(total_return_pct, 2),
+            'total_trades': len(sorted_trades)
+        })
+
+    except Exception as e:
+        logger.error(f"Erro em /api/equity-history: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/pnl-by-symbol')
+def api_pnl_by_symbol():
+    """
+    PnL agregado por simbolo.
+    Retorna dados para grafico de barras ou pie chart.
+    """
+    try:
+        # Carregar trade history
+        trade_history = load_json_safe('state/trade_history.json')
+        if not isinstance(trade_history, list):
+            trade_history = []
+
+        # Agregar por simbolo
+        symbol_stats = {}
+        for trade in trade_history:
+            symbol = trade.get('symbol', 'UNKNOWN')
+            pnl = trade.get('pnl', 0)
+
+            if symbol not in symbol_stats:
+                symbol_stats[symbol] = {
+                    'symbol': symbol,
+                    'total_pnl': 0,
+                    'trades': 0,
+                    'wins': 0,
+                    'losses': 0,
+                    'gross_profit': 0,
+                    'gross_loss': 0
+                }
+
+            symbol_stats[symbol]['total_pnl'] += pnl
+            symbol_stats[symbol]['trades'] += 1
+
+            if pnl > 0:
+                symbol_stats[symbol]['wins'] += 1
+                symbol_stats[symbol]['gross_profit'] += pnl
+            else:
+                symbol_stats[symbol]['losses'] += 1
+                symbol_stats[symbol]['gross_loss'] += abs(pnl)
+
+        # Calcular metricas adicionais
+        result = []
+        for sym, stats in symbol_stats.items():
+            win_rate = (stats['wins'] / stats['trades'] * 100) if stats['trades'] > 0 else 0
+            profit_factor = (stats['gross_profit'] / stats['gross_loss']) if stats['gross_loss'] > 0 else stats['gross_profit']
+
+            result.append({
+                'symbol': sym,
+                'total_pnl': round(stats['total_pnl'], 2),
+                'trades': stats['trades'],
+                'wins': stats['wins'],
+                'losses': stats['losses'],
+                'win_rate': round(win_rate, 1),
+                'profit_factor': round(profit_factor, 2),
+                'avg_pnl': round(stats['total_pnl'] / stats['trades'], 2) if stats['trades'] > 0 else 0
+            })
+
+        # Ordenar por PnL total (maior primeiro)
+        result.sort(key=lambda x: x['total_pnl'], reverse=True)
+
+        return jsonify({
+            'symbols': result,
+            'total_symbols': len(result),
+            'best_symbol': result[0] if result else None,
+            'worst_symbol': result[-1] if result else None
+        })
+
+    except Exception as e:
+        logger.error(f"Erro em /api/pnl-by-symbol: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/pnl-distribution')
+def api_pnl_distribution():
+    """
+    Distribuicao de PnL para histograma.
+    Retorna bins e frequencias.
+    """
+    try:
+        # Carregar trade history
+        trade_history = load_json_safe('state/trade_history.json')
+        if not isinstance(trade_history, list) or len(trade_history) == 0:
+            return jsonify({
+                'distribution': [],
+                'stats': {
+                    'mean': 0,
+                    'median': 0,
+                    'std': 0,
+                    'min': 0,
+                    'max': 0,
+                    'total_trades': 0
+                }
+            })
+
+        # Extrair PnLs
+        pnls = [t.get('pnl', 0) for t in trade_history]
+
+        # Calcular estatisticas
+        import statistics
+        mean_pnl = statistics.mean(pnls)
+        median_pnl = statistics.median(pnls)
+        std_pnl = statistics.stdev(pnls) if len(pnls) > 1 else 0
+        min_pnl = min(pnls)
+        max_pnl = max(pnls)
+
+        # Criar bins para histograma
+        num_bins = min(20, max(5, len(pnls) // 5))
+        bin_width = (max_pnl - min_pnl) / num_bins if max_pnl != min_pnl else 1
+
+        bins = []
+        for i in range(num_bins):
+            bin_start = min_pnl + i * bin_width
+            bin_end = bin_start + bin_width
+            count = sum(1 for p in pnls if bin_start <= p < bin_end)
+            if i == num_bins - 1:  # Ultimo bin inclui o max
+                count = sum(1 for p in pnls if bin_start <= p <= bin_end)
+
+            bins.append({
+                'bin_start': round(bin_start, 2),
+                'bin_end': round(bin_end, 2),
+                'count': count,
+                'label': f"${bin_start:.0f} - ${bin_end:.0f}"
+            })
+
+        return jsonify({
+            'distribution': bins,
+            'pnls': [round(p, 2) for p in pnls],  # Lista completa para Plotly
+            'stats': {
+                'mean': round(mean_pnl, 2),
+                'median': round(median_pnl, 2),
+                'std': round(std_pnl, 2),
+                'min': round(min_pnl, 2),
+                'max': round(max_pnl, 2),
+                'total_trades': len(pnls),
+                'positive_trades': sum(1 for p in pnls if p > 0),
+                'negative_trades': sum(1 for p in pnls if p < 0)
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"Erro em /api/pnl-distribution: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/signals')
+def api_signals():
+    """
+    Sinais MTF em tempo real.
+    Le do arquivo state/mtf_signals.json que o bot atualiza a cada ciclo.
+    """
+    try:
+        # Ler sinais MTF do arquivo
+        signals_data = load_json_safe('state/mtf_signals.json')
+        if not signals_data:
+            signals_data = {'signals': [], 'last_update': None}
+
+        # Usar lista de simbolos do Config (dinamico)
+        all_symbols = Config.get('symbols', SYMBOLS)
+
+        return jsonify({
+            'signals': signals_data.get('signals', [])[:15],  # Top 15 sinais
+            'total_signals': len(signals_data.get('signals', [])),
+            'last_update': signals_data.get('last_update'),
+            'monitored_symbols': len(Config.get('symbols', SYMBOLS)),
+            'active_timeframes': Config.get('timeframes.active_timeframes', ['5m', '15m', '1h']),
+            'mtf_stats': signals_data.get('stats', {})
+        })
+    except Exception as e:
+        logger.error(f"Erro em /api/signals: {e}")
+        return jsonify({'error': str(e), 'signals': []})
+
+
+@app.route('/api/bot-status')
+def api_bot_status():
+    """
+    Status detalhado do bot (running, PID, uptime, scanning info).
+    """
+    try:
+        bot_lock_file = 'state/bot.lock'
+        bot_running = os.path.exists(bot_lock_file)
+
+        response = {
+            'running': bot_running,
+            'pid': None,
+            'uptime_seconds': 0,
+            'start_time': None,
+            'mode': 'TESTNET' if USE_TESTNET else 'PRODUCTION',
+            'symbols_count': len(Config.get('symbols', SYMBOLS)),
+            'timeframe': PRIMARY_TIMEFRAME,
+            'active_timeframes': Config.get('timeframes.active_timeframes', ['5m', '15m', '1h']),
+            'mtf_enabled': True,
+            'kelly_enabled': Config.get('trader.use_kelly_sizing', False),
+            'scanning_symbols': []
+        }
+
+        if bot_running:
+            try:
+                with open(bot_lock_file, 'r') as f:
+                    bot_pid = f.read().strip()
+                    response['pid'] = bot_pid
+
+                # Tentar obter uptime do arquivo (se existir)
+                lock_stat = os.stat(bot_lock_file)
+                start_time = datetime.fromtimestamp(lock_stat.st_mtime)
+                uptime = (datetime.now() - start_time).total_seconds()
+                response['start_time'] = start_time.isoformat()
+                response['uptime_seconds'] = int(uptime)
+                response['uptime_formatted'] = f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m {int(uptime % 60)}s"
+            except Exception:
+                pass
+
+        # Adicionar ultimos simbolos escaneados (do log)
+        try:
+            if os.path.exists('logs/bot.log'):
+                with open('logs/bot.log', 'r', encoding='utf-8') as f:
+                    lines = f.readlines()[-50:]
+                    scanning = []
+                    for line in reversed(lines):
+                        if 'MTF SINAL' in line:
+                            # Extrair simbolo do log
+                            parts = line.split('MTF SINAL')
+                            if len(parts) > 1:
+                                sym_part = parts[1].strip().split()[0]
+                                if sym_part not in scanning:
+                                    scanning.append(sym_part)
+                                if len(scanning) >= 5:
+                                    break
+                    response['scanning_symbols'] = scanning
+        except Exception:
+            pass
+
+        return jsonify(response)
+    except Exception as e:
+        logger.error(f"Erro em /api/bot-status: {e}")
+        return jsonify({'error': str(e), 'running': False})
 
 
 @app.route('/api/metrics')

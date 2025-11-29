@@ -3,7 +3,15 @@
     "allow": [
       "Bash(python:*)",
       "Bash(del \"C:\\Users\\email\\OneDrive\\Desktop\\desafio maior lucro possivel\\state\\current_best.json\")",
-      "Bash(Remove-Item \"C:\\Users\\email\\OneDrive\\Desktop\\desafio maior lucro possivel\\state\\current_best.json\" -Force -ErrorAction SilentlyContinue)"
+      "Bash(Remove-Item \"C:\\Users\\email\\OneDrive\\Desktop\\desafio maior lucro possivel\\state\\current_best.json\" -Force -ErrorAction SilentlyContinue)",
+      "Bash(dir \"C:\\Users\\email\\OneDrive\\Desktop\\desafio maior lucro possivel\")",
+      "Bash(dir \"C:\\Users\\email\\OneDrive\\Desktop\\desafio maior lucro possivel\\config\")",
+      "Bash(dir \"C:\\Users\\email\\OneDrive\\Desktop\\desafio maior lucro possivel\\wfo\")",
+      "Bash(dir \"C:\\Users\\email\\OneDrive\\Desktop\\desafio maior lucro possivel\\wfo\\strategies\")",
+      "Bash(find:*)",
+      "Bash(cat:*)",
+      "Bash(git log:*)",
+      "Bash(ls:*)"
     ],
     "deny": [],
     "ask": []

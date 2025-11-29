@@ -2,13 +2,16 @@
 Data Module - Market Data Handling
 Fetch and process market data from exchange
 
-VERSÃO: 2.0
+VERSÃO: 2.1
 - Cache com TTL ativo e limpeza automática
 - Logging adequado
+- Thread-safe cache com Lock
+- TTL dinâmico por timeframe
 """
 import pandas as pd
 import numpy as np
 import logging
+import threading
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
 import time
@@ -23,34 +26,47 @@ class MarketData:
     Inclui cache com TTL e limpeza automática.
     """
 
+    # TTL dinâmico por timeframe (em segundos)
+    TTL_BY_TIMEFRAME = {
+        '1m': 30,     # 30s para 1m
+        '5m': 120,    # 2 min para 5m
+        '15m': 300,   # 5 min para 15m
+        '30m': 600,   # 10 min para 30m
+        '1h': 1800,   # 30 min para 1h
+        '4h': 3600,   # 1h para 4h
+        '1d': 7200,   # 2h para 1d
+    }
+
     def __init__(self, exchange):
         self.exchange = exchange
         self.cache = {}
-        self.cache_ttl = 60  # seconds
+        self.cache_ttl = 60  # default TTL (seconds)
+        self._cache_lock = threading.Lock()  # Thread-safe lock
         self._last_cleanup = datetime.now()
         self._cleanup_interval = 300  # Limpar cache a cada 5 minutos
 
     def _cleanup_cache(self):
-        """Remove entradas expiradas do cache."""
+        """Remove entradas expiradas do cache (thread-safe)."""
         now = datetime.now()
 
         # Só limpar a cada _cleanup_interval segundos
         if (now - self._last_cleanup).total_seconds() < self._cleanup_interval:
             return
 
-        self._last_cleanup = now
-        expired_keys = []
+        with self._cache_lock:
+            self._last_cleanup = now
+            expired_keys = []
 
-        for key, (cached_time, _) in self.cache.items():
-            age = (now - cached_time).total_seconds()
-            if age > self.cache_ttl * 10:  # Remover após 10x o TTL
-                expired_keys.append(key)
+            for key, (cached_time, _, ttl) in self.cache.items():
+                age = (now - cached_time).total_seconds()
+                if age > ttl * 10:  # Remover após 10x o TTL
+                    expired_keys.append(key)
 
-        for key in expired_keys:
-            del self.cache[key]
+            for key in expired_keys:
+                del self.cache[key]
 
-        if expired_keys:
-            logger.debug(f"Cache cleanup: {len(expired_keys)} entradas removidas")
+            if expired_keys:
+                logger.debug(f"Cache cleanup: {len(expired_keys)} entradas removidas")
     
     def fetch_ohlcv(
         self,
@@ -76,32 +92,37 @@ class MarketData:
 
         cache_key = f"{symbol}_{timeframe}_{limit}"
 
-        # Check cache
-        if use_cache and cache_key in self.cache:
-            cached_time, cached_data = self.cache[cache_key]
-            if (datetime.now() - cached_time).seconds < self.cache_ttl:
-                return cached_data.copy()
-        
+        # TTL dinâmico por timeframe
+        ttl = self.TTL_BY_TIMEFRAME.get(timeframe, self.cache_ttl)
+
+        # Check cache (thread-safe)
+        with self._cache_lock:
+            if use_cache and cache_key in self.cache:
+                cached_time, cached_data, cached_ttl = self.cache[cache_key]
+                if (datetime.now() - cached_time).total_seconds() < cached_ttl:
+                    return cached_data.copy()
+
         try:
             ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-            
+
             if not ohlcv:
                 return pd.DataFrame()
-            
+
             df = pd.DataFrame(
                 ohlcv,
                 columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
             )
-            
+
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            
-            # Cache result
-            self.cache[cache_key] = (datetime.now(), df.copy())
-            
+
+            # Cache result (thread-safe) com TTL dinâmico
+            with self._cache_lock:
+                self.cache[cache_key] = (datetime.now(), df.copy(), ttl)
+
             return df
             
         except Exception as e:
-            print(f"Error fetching OHLCV for {symbol}: {e}")
+            logger.warning(f"Error fetching OHLCV for {symbol}: {e}")
             return pd.DataFrame()
     
     def fetch_multi_timeframe(
@@ -182,7 +203,7 @@ class MarketData:
                 time.sleep(0.1)  # Rate limiting
                 
             except Exception as e:
-                print(f"Error fetching historical data: {e}")
+                logger.warning(f"Error fetching historical data: {e}")
                 break
         
         if not all_data:
@@ -235,6 +256,69 @@ class MarketData:
             return {'bids': [], 'asks': [], 'spread': 0}
 
 
+def fetch_ohlcv_multi(
+    symbols: List[str],
+    timeframe: str = '1h',
+    days: int = 180,
+    limit: int = 1000,
+    exchange: Any = None
+) -> Dict[str, pd.DataFrame]:
+    """
+    Fetch OHLCV data for multiple symbols.
+
+    Args:
+        symbols: List of trading pairs
+        timeframe: Candle timeframe
+        days: Number of days to fetch
+        limit: Max candles per request (used as hint)
+        exchange: CCXT exchange instance (optional, creates one if None)
+
+    Returns:
+        Dict of symbol -> DataFrame with OHLCV data
+    """
+    # Create exchange if not provided
+    if exchange is None:
+        try:
+            import ccxt
+            from core.config import Config
+
+            use_testnet = Config.get('api.use_testnet', True)
+
+            exchange = ccxt.binance({
+                'enableRateLimit': True,
+                'options': {
+                    'defaultType': 'future',
+                    'adjustForTimeDifference': True
+                }
+            })
+
+            if use_testnet:
+                exchange.set_sandbox_mode(True)
+
+        except Exception as e:
+            logger.error(f"Failed to create exchange: {e}")
+            return {}
+
+    result = {}
+    md = MarketData(exchange)
+
+    for symbol in symbols:
+        try:
+            df = md.fetch_historical(symbol, timeframe, days, max_requests=20)
+            if not df.empty:
+                result[symbol] = df
+                logger.info(f"Fetched {len(df)} candles for {symbol}")
+            else:
+                logger.warning(f"No data for {symbol}")
+        except Exception as e:
+            logger.error(f"Error fetching {symbol}: {e}")
+            continue
+
+        time.sleep(0.2)  # Rate limiting
+
+    return result
+
+
 def download_data(
     exchange,
     symbol: str,
@@ -260,6 +344,6 @@ def download_data(
     
     if output_file and not df.empty:
         df.to_csv(output_file, index=False)
-        print(f"Data saved to {output_file}: {len(df)} candles")
+        logger.info(f"Data saved to {output_file}: {len(df)} candles")
     
     return df

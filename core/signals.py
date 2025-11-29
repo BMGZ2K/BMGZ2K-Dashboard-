@@ -9,11 +9,12 @@ CHANGELOG:
 """
 import pandas as pd
 import numpy as np
+import threading
 from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
 
-# Importar parâmetros centralizados
-from .config import WFO_VALIDATED_PARAMS, get_param
+# Importar Config centralizado
+from .config import Config, get_param
 
 # Importar estratégias otimizadas (compatibilidade)
 try:
@@ -138,6 +139,93 @@ def calculate_stochastic(high: pd.Series, low: pd.Series, close: pd.Series, k_pe
     return k, d
 
 
+def calculate_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    Calcular MACD (Moving Average Convergence Divergence).
+    Conforme padrão TradingView/Binance.
+
+    Returns:
+        macd_line, signal_line, histogram
+    """
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def calculate_volume_profile(volume: pd.Series, period: int = 20) -> Tuple[pd.Series, pd.Series]:
+    """
+    Calcular perfil de volume.
+
+    Returns:
+        volume_ma: Media movel do volume
+        volume_ratio: Volume atual / media (>1 = acima da media)
+    """
+    volume_ma = volume.rolling(period).mean()
+    volume_ratio = volume / (volume_ma + 1e-10)
+    return volume_ma, volume_ratio
+
+
+def calculate_rsi_divergence(close: pd.Series, rsi: pd.Series, lookback: int = 14) -> Tuple[bool, bool]:
+    """
+    Detectar divergências RSI.
+
+    Returns:
+        bullish_divergence: Preço novo low + RSI higher low
+        bearish_divergence: Preço novo high + RSI lower high
+    """
+    bullish_div = False
+    bearish_div = False
+
+    if len(close) < lookback + 2:
+        return bullish_div, bearish_div
+
+    # Últimos N candles
+    price_recent = close.iloc[-lookback:]
+    rsi_recent = rsi.iloc[-lookback:]
+
+    # Encontrar minimos e maximos locais
+    price_min_idx = price_recent.idxmin()
+    price_max_idx = price_recent.idxmax()
+
+    # Verificar divergencia bullish
+    # Preço fez novo low, mas RSI fez higher low
+    if price_min_idx == price_recent.index[-1] or price_min_idx == price_recent.index[-2]:
+        # Preço está nos mínimos recentes
+        prev_low_idx = price_recent.iloc[:-3].idxmin() if len(price_recent) > 3 else None
+        if prev_low_idx is not None:
+            if close.loc[price_min_idx] < close.loc[prev_low_idx]:
+                # Preço fez novo low
+                if rsi.loc[price_min_idx] > rsi.loc[prev_low_idx]:
+                    # RSI fez higher low = divergência bullish
+                    bullish_div = True
+
+    # Verificar divergencia bearish
+    # Preço fez novo high, mas RSI fez lower high
+    if price_max_idx == price_recent.index[-1] or price_max_idx == price_recent.index[-2]:
+        prev_high_idx = price_recent.iloc[:-3].idxmax() if len(price_recent) > 3 else None
+        if prev_high_idx is not None:
+            if close.loc[price_max_idx] > close.loc[prev_high_idx]:
+                # Preço fez novo high
+                if rsi.loc[price_max_idx] < rsi.loc[prev_high_idx]:
+                    # RSI fez lower high = divergência bearish
+                    bearish_div = True
+
+    return bullish_div, bearish_div
+
+
+def calculate_momentum(close: pd.Series, period: int = 10) -> pd.Series:
+    """
+    Calcular Rate of Change (Momentum).
+
+    Returns:
+        ROC em percentual
+    """
+    return ((close - close.shift(period)) / close.shift(period)) * 100
+
+
 class SignalGenerator:
     """
     Gerador de sinais otimizado.
@@ -154,8 +242,8 @@ class SignalGenerator:
     """
 
     def __init__(self, params: Dict = None):
-        # Combinar parâmetros passados com defaults centralizados
-        self.params = WFO_VALIDATED_PARAMS.copy()
+        # Combinar parâmetros passados com defaults do Config centralizado
+        self.params = Config.get_strategy_params()
         if params:
             self.params.update(params)
 
@@ -187,9 +275,11 @@ class SignalGenerator:
         # Strategy mode
         self.strategy = self.params.get('strategy', get_param('strategy', 'stoch_extreme'))
 
-        # Bias params
-        self.long_bias = self.params.get('long_bias', 1.1)
-        self.short_penalty = self.params.get('short_penalty', 0.9)
+        # Bias params (do config centralizado - padrão neutro 1.0 se não definido)
+        # NOTA: long_bias > 1.0 favorece LONGs, short_penalty < 1.0 penaliza SHORTs
+        # Estes parâmetros devem ser validados via WFO, não hardcoded
+        self.long_bias = self.params.get('long_bias', get_param('long_bias', 1.0))
+        self.short_penalty = self.params.get('short_penalty', get_param('short_penalty', 1.0))
 
         # Signal strength params
         self.min_signal_strength = self.params.get('min_signal_strength', 5)
@@ -222,10 +312,30 @@ class SignalGenerator:
 
         # Data validation
         self.min_data_points = self.params.get('min_data_points', 50)
+
+        # Confluence scoring params
+        self.use_confluence = self.params.get('use_confluence', True)
+        self.min_confluence_for_bonus = self.params.get('min_confluence_for_bonus', 2)
+
+        # Multi-timeframe params (B2)
+        self.use_htf_filter = self.params.get('use_htf_filter', True)
+        self.htf_ema_fast = self.params.get('htf_ema_fast', 9)
+        self.htf_ema_slow = self.params.get('htf_ema_slow', 21)
+        self.htf_threshold = self.params.get('htf_threshold', 0.002)  # 0.2%
+
+        # Cache para HTF trend (atualizado externamente) - thread-safe
+        self._htf_trend_cache: Dict[str, str] = {}
+        self._htf_cache_lock = threading.Lock()
     
     def prepare_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Preparar dados com indicadores."""
         df = df.copy()
+
+        # Garantir que timestamp é o índice (necessário para WFO multi-symbol)
+        if 'timestamp' in df.columns and not isinstance(df.index, pd.DatetimeIndex):
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df.set_index('timestamp')
+            df = df.sort_index()
 
         # Indicadores basicos
         df['rsi'] = calculate_rsi(df['close'], self.rsi_period)
@@ -246,7 +356,235 @@ class SignalGenerator:
         df['bb_lower'] = bb_lower
 
         return df
-    
+
+    def calculate_confluence_score(self, df: pd.DataFrame) -> Dict:
+        """
+        MELHORIA C2: Calcular score de confluência de indicadores.
+
+        Analisa múltiplos indicadores e retorna quantos concordam em cada direção.
+        Isso permite aumentar a confiança do sinal quando múltiplos indicadores concordam.
+
+        Returns:
+            Dict com:
+            - long_confluence: número de indicadores apontando LONG
+            - short_confluence: número de indicadores apontando SHORT
+            - long_strength: força agregada dos sinais LONG
+            - short_strength: força agregada dos sinais SHORT
+            - signals: lista de (indicador, direção, força)
+        """
+        signals = []
+
+        # Extrair valores
+        rsi = df['rsi'].values[-1]
+        stoch_k = df['stoch_k'].values[-1]
+        ema_f = df['ema_fast'].values[-1]
+        ema_s = df['ema_slow'].values[-1]
+        price = df['close'].values[-1]
+        bb_lower = df['bb_lower'].values[-1]
+        bb_upper = df['bb_upper'].values[-1]
+
+        # RSI signal
+        if not np.isnan(rsi):
+            if rsi < 30:
+                signals.append(('rsi', 'long', min(1.5, (30 - rsi) / 10)))
+            elif rsi > 70:
+                signals.append(('rsi', 'short', min(1.5, (rsi - 70) / 10)))
+
+        # Stochastic signal
+        if not np.isnan(stoch_k):
+            if stoch_k < 20:
+                signals.append(('stoch', 'long', min(1.5, (20 - stoch_k) / 10)))
+            elif stoch_k > 80:
+                signals.append(('stoch', 'short', min(1.5, (stoch_k - 80) / 10)))
+
+        # EMA signal (trend)
+        if not np.isnan(ema_f) and not np.isnan(ema_s) and ema_s != 0:
+            ema_diff_pct = (ema_f - ema_s) / ema_s * 100
+            if ema_f > ema_s:
+                signals.append(('ema', 'long', min(1.5, abs(ema_diff_pct) / 2)))
+            else:
+                signals.append(('ema', 'short', min(1.5, abs(ema_diff_pct) / 2)))
+
+        # Bollinger Bands signal
+        if not np.isnan(bb_lower) and not np.isnan(bb_upper):
+            if price < bb_lower:
+                signals.append(('bb', 'long', 1.0))
+            elif price > bb_upper:
+                signals.append(('bb', 'short', 1.0))
+
+        # Contar confluência
+        long_count = sum(1 for s in signals if s[1] == 'long')
+        short_count = sum(1 for s in signals if s[1] == 'short')
+        long_strength = sum(s[2] for s in signals if s[1] == 'long')
+        short_strength = sum(s[2] for s in signals if s[1] == 'short')
+
+        return {
+            'long_confluence': long_count,
+            'short_confluence': short_count,
+            'long_strength': long_strength,
+            'short_strength': short_strength,
+            'signals': signals
+        }
+
+    def check_htf_trend(self, df_htf: pd.DataFrame) -> str:
+        """
+        MELHORIA B2: Verificar tendência no timeframe superior (HTF).
+
+        Args:
+            df_htf: DataFrame com dados do timeframe superior (ex: 4h)
+
+        Returns:
+            'bullish': EMA fast > EMA slow * (1 + threshold)
+            'bearish': EMA fast < EMA slow * (1 - threshold)
+            'neutral': Sem tendência clara
+        """
+        if df_htf is None or len(df_htf) < 30:
+            return 'neutral'
+
+        try:
+            ema_fast = df_htf['close'].ewm(span=self.htf_ema_fast, adjust=False).mean().values[-1]
+            ema_slow = df_htf['close'].ewm(span=self.htf_ema_slow, adjust=False).mean().values[-1]
+
+            if np.isnan(ema_fast) or np.isnan(ema_slow) or ema_slow == 0:
+                return 'neutral'
+
+            # Verificar tendência com threshold
+            if ema_fast > ema_slow * (1 + self.htf_threshold):
+                return 'bullish'
+            elif ema_fast < ema_slow * (1 - self.htf_threshold):
+                return 'bearish'
+            return 'neutral'
+
+        except Exception:
+            return 'neutral'
+
+    def update_htf_trend(self, symbol: str, df_htf: pd.DataFrame) -> str:
+        """
+        Atualiza cache de tendência HTF para um símbolo.
+
+        Args:
+            symbol: Símbolo (ex: 'BTC/USDT')
+            df_htf: DataFrame do timeframe superior
+
+        Returns:
+            Tendência detectada ('bullish', 'bearish', 'neutral')
+        """
+        trend = self.check_htf_trend(df_htf)
+        self._htf_trend_cache[symbol] = trend
+        return trend
+
+    def get_htf_trend(self, symbol: str) -> str:
+        """Obtém tendência HTF do cache."""
+        return self._htf_trend_cache.get(symbol, 'neutral')
+
+    def detect_market_regime(self, df: pd.DataFrame) -> str:
+        """
+        FASE 3.4: Detectar regime de mercado baseado em ADX.
+
+        Args:
+            df: DataFrame com indicadores
+
+        Returns:
+            'trending' se ADX > 25
+            'ranging' se ADX < 18
+            'mixed' caso contrário
+        """
+        adx = df['adx'].values[-1]
+
+        if np.isnan(adx):
+            return 'mixed'
+
+        if adx > 25:
+            return 'trending'
+        elif adx < 18:
+            return 'ranging'
+        else:
+            return 'mixed'
+
+    def validate_regime_for_signal(self, signal: 'Signal', df: pd.DataFrame) -> 'Signal':
+        """
+        FASE 3.4: Validar se sinal é apropriado para regime atual.
+
+        Penaliza sinais que não combinam com o regime de mercado:
+        - Mean reversion em mercado trending → penalizar
+        - Momentum/trend em mercado ranging → penalizar
+
+        Args:
+            signal: Sinal gerado
+            df: DataFrame com indicadores
+
+        Returns:
+            Signal ajustado
+        """
+        if signal.direction == 'none':
+            return signal
+
+        regime = self.detect_market_regime(df)
+        strategy_type = signal.strategy.lower() if signal.strategy else ''
+
+        # Identificar tipo de estratégia
+        is_mean_reversion = 'reversion' in strategy_type or 'mr' in strategy_type or 'pullback' in strategy_type
+        is_momentum = 'momentum' in strategy_type or 'burst' in strategy_type
+        is_trend = 'trend' in strategy_type or 'ema' in strategy_type
+
+        # Validar combinação regime/estratégia
+        penalty = 1.0
+
+        if is_mean_reversion and regime == 'trending':
+            # Mean reversion em tendência forte → não funciona bem
+            penalty = 0.3
+        elif (is_momentum or is_trend) and regime == 'ranging':
+            # Momentum/trend em mercado lateral → whipsaws
+            penalty = 0.3
+        elif regime == 'mixed':
+            # Regime misto → sem penalidade (ocorre 70% do tempo)
+            penalty = 1.0
+
+        if penalty < 1.0:
+            return Signal(
+                signal.direction,
+                signal.strength * penalty,
+                signal.entry_price,
+                signal.stop_loss,
+                signal.take_profit,
+                f"{signal.reason} [regime={regime}]",
+                signal.strategy,
+                signal.confidence * penalty
+            )
+
+        return signal
+
+    def is_signal_aligned_with_htf(self, direction: str, symbol: str = None, htf_trend: str = None) -> bool:
+        """
+        MELHORIA B2: Verifica se o sinal está alinhado com a tendência HTF.
+
+        Regras:
+        - LONG permitido se HTF = bullish ou neutral
+        - SHORT permitido se HTF = bearish ou neutral
+
+        Args:
+            direction: 'long' ou 'short'
+            symbol: Símbolo para buscar no cache
+            htf_trend: Tendência HTF já calculada (opcional)
+
+        Returns:
+            True se alinhado, False se contra a tendência
+        """
+        if not self.use_htf_filter:
+            return True
+
+        # Usar tendência passada ou buscar do cache
+        trend = htf_trend or self.get_htf_trend(symbol or '')
+
+        if direction == 'long':
+            # LONG só se HTF bullish ou neutral
+            return trend in ('bullish', 'neutral')
+        elif direction == 'short':
+            # SHORT só se HTF bearish ou neutral
+            return trend in ('bearish', 'neutral')
+
+        return True
+
     def generate_signal(self, df: pd.DataFrame, precomputed: bool = False) -> Signal:
         """
         Gerar sinal baseado na estrategia selecionada.
@@ -292,32 +630,90 @@ class SignalGenerator:
                 )
 
         # ========== ESTRATÉGIAS V1 (LEGADO) ==========
+        signal = None
         if self.strategy == 'rsi_extremes' or self.strategy == 'rsi_extreme':
-            return self._signal_rsi_extremes(df)
+            signal = self._signal_rsi_extremes(df)
         elif self.strategy == 'stoch_extreme':
-            return self._signal_stoch_extreme(df)
+            signal = self._signal_stoch_extreme(df)
         elif self.strategy == 'trend_following' or self.strategy == 'trend_adx':
-            return self._signal_trend_following(df)
+            signal = self._signal_trend_following(df)
         elif self.strategy == 'mean_reversion' or self.strategy == 'pullback':
-            return self._signal_mean_reversion(df)
+            signal = self._signal_mean_reversion(df)
         elif self.strategy == 'momentum_burst':
-            return self._signal_momentum_burst(df)
+            signal = self._signal_momentum_burst(df)
 
         # ========== DEFAULT: Usar Combined (melhor performance) ==========
-        if self._optimized_strategies is not None:
-            opt_signal = self._optimized_strategies.generate_signal(df, 'combined')
-            return Signal(
-                opt_signal.direction,
-                opt_signal.strength,
-                opt_signal.entry_price,
-                opt_signal.stop_loss,
-                opt_signal.take_profit,
-                opt_signal.reason,
-                opt_signal.strategy,
-                opt_signal.confidence
+        if signal is None:
+            if self._optimized_strategies is not None:
+                opt_signal = self._optimized_strategies.generate_signal(df, 'combined')
+                signal = Signal(
+                    opt_signal.direction,
+                    opt_signal.strength,
+                    opt_signal.entry_price,
+                    opt_signal.stop_loss,
+                    opt_signal.take_profit,
+                    opt_signal.reason,
+                    opt_signal.strategy,
+                    opt_signal.confidence
+                )
+            else:
+                signal = self._signal_stoch_extreme(df)  # Fallback para V1
+
+        # ========== FASE 4.1: FILTRO HTF OBRIGATÓRIO (MULTI-TIMEFRAME) ==========
+        # REJEITA sinais que vão contra a tendência do timeframe superior (4h)
+        # Mudança de "penalizar 50%" para "rejeitar completamente"
+        if signal.direction != 'none' and self.use_htf_filter:
+            # Verificar alinhamento com HTF (usa cache interno)
+            if not self.is_signal_aligned_with_htf(signal.direction):
+                # FASE 4.1: Rejeitar completamente sinais contra HTF
+                return Signal('none', 0, signal.entry_price, 0, 0, f'{signal.reason} [HTF REJECTED]')
+
+        # ========== FASE 3.4: VALIDAÇÃO DE REGIME DE MERCADO ==========
+        if signal.direction != 'none':
+            signal = self.validate_regime_for_signal(signal, df)
+
+        # ========== FASE 4.2: CONFLUENCE SCORING COM MULTIPLICADORES ==========
+        # Mudança de bônus aditivo (+0.5) para multiplicadores (1.8x, 1.4x, 0.7x)
+        if self.use_confluence and signal.direction != 'none':
+            confluence = self.calculate_confluence_score(df)
+
+            if signal.direction == 'long':
+                conf_count = confluence['long_confluence']
+            else:  # short
+                conf_count = confluence['short_confluence']
+
+            # FASE 4.2: Usar multiplicadores em vez de bônus aditivos
+            if conf_count >= 3:  # 3+ indicadores alinhados
+                strength_multiplier = 1.8  # 80% boost
+                conf_label = 'STRONG'
+            elif conf_count >= 2:  # 2 indicadores alinhados
+                strength_multiplier = 1.4  # 40% boost
+                conf_label = 'GOOD'
+            elif conf_count == 1:  # Apenas 1 indicador
+                strength_multiplier = 1.0  # Sem mudança
+                conf_label = 'OK'
+            else:  # 0 indicadores alinhados
+                strength_multiplier = 0.7  # 30% penalidade
+                conf_label = 'WEAK'
+
+            new_strength = min(self.max_signal_strength, signal.strength * strength_multiplier)
+
+            # Confiança baseada na confluência (0-1)
+            new_confidence = min(1.0, conf_count / 4)
+
+            # Criar signal com valores atualizados
+            signal = Signal(
+                signal.direction,
+                new_strength,
+                signal.entry_price,
+                signal.stop_loss,
+                signal.take_profit,
+                f"{signal.reason} [conf={conf_label}]",
+                signal.strategy,
+                new_confidence
             )
-        else:
-            return self._signal_stoch_extreme(df)  # Fallback para V1
+
+        return signal
     
     def _signal_rsi_extremes(self, df: pd.DataFrame) -> Signal:
         """
@@ -395,6 +791,11 @@ class SignalGenerator:
         ema_fast_arr = df['ema_fast'].values
         ema_slow_arr = df['ema_slow'].values
 
+        # Validar que temos dados suficientes para acessar índices anteriores
+        if len(stoch_k_arr) < 2 or len(ema_fast_arr) < 2:
+            price = close_arr[-1] if len(close_arr) > 0 else 0
+            return Signal('none', 0, price, 0, 0, 'Insufficient data for stochastic')
+
         price = close_arr[-1]
         atr = atr_arr[-1]
         adx = adx_arr[-1]
@@ -425,26 +826,35 @@ class SignalGenerator:
         # Tendência confirmada por ADX
         trend_strong = adx > self.adx_min
 
-        # Long: Stochastic oversold EXTREMO com cross up + confirmação de trend
-        # OTIMIZADO: Removido +10, agora usa zona extrema estrita
+        # Long: Stochastic oversold EXTREMO com cross up
+        # CORRIGIDO: Para reversões, não exigir EMA bullish (seria contraditório)
+        # Condições: (1) Stoch oversold + cross up + ADX confirma tendência existe
+        #            (2) OU EMA cross up (entrada em pullback)
         if stoch_k < self.stoch_oversold and stoch_cross_up:
-            if ema_cross_up or (ema_f > ema_s and trend_strong):
+            # ADX forte indica que havia tendência - bom para reversão
+            if trend_strong or ema_cross_up:
                 direction = 'long'
                 # Cálculo otimizado de strength (usando params)
                 oversold_bonus = min(2.0, (self.stoch_oversold - stoch_k) / 5)
-                trend_bonus = 2.0 if ema_cross_up else min(2.0, (adx - self.adx_min) / 15)
-                strength = min(self.max_signal_strength, self.stoch_base_strength + oversold_bonus + trend_bonus)
-                reason = f'Stoch extreme up ({stoch_k:.0f}) + EMA bull + ADX {adx:.0f}'
+                # Bonus maior se EMA também confirma, menor se só ADX
+                trend_bonus = 2.0 if ema_cross_up else min(1.5, (adx - self.adx_min) / 20)
+                # Se EMA bearish mas ADX forte, reduzir strength (mais arriscado)
+                ema_penalty = 0 if ema_f >= ema_s else 0.5
+                strength = min(self.max_signal_strength, self.stoch_base_strength + oversold_bonus + trend_bonus - ema_penalty)
+                reason = f'Stoch extreme up ({stoch_k:.0f}) ADX {adx:.0f}'
 
-        # Short: Stochastic overbought EXTREMO com cross down + confirmação de trend
+        # Short: Stochastic overbought EXTREMO com cross down
+        # CORRIGIDO: Mesma lógica - não exigir EMA bearish para reversão
         elif stoch_k > self.stoch_overbought and stoch_cross_down:
-            if ema_cross_down or (ema_f < ema_s and trend_strong):
+            if trend_strong or ema_cross_down:
                 direction = 'short'
                 # Cálculo otimizado de strength (usando params)
                 overbought_bonus = min(2.0, (stoch_k - self.stoch_overbought) / 5)
-                trend_bonus = 2.0 if ema_cross_down else min(2.0, (adx - self.adx_min) / 15)
-                strength = min(self.max_signal_strength, self.stoch_base_strength + overbought_bonus + trend_bonus)
-                reason = f'Stoch extreme down ({stoch_k:.0f}) + EMA bear + ADX {adx:.0f}'
+                trend_bonus = 2.0 if ema_cross_down else min(1.5, (adx - self.adx_min) / 20)
+                # Se EMA bullish mas ADX forte, reduzir strength (mais arriscado)
+                ema_penalty = 0 if ema_f <= ema_s else 0.5
+                strength = min(self.max_signal_strength, self.stoch_base_strength + overbought_bonus + trend_bonus - ema_penalty)
+                reason = f'Stoch extreme down ({stoch_k:.0f}) ADX {adx:.0f}'
 
         # Sinais mais agressivos: EMA cross com ADX forte (mesmo sem stochastic extremo)
         # CORRIGIDO: Usar adx_aggressive de params ao invés de hardcoded 30
@@ -474,6 +884,8 @@ class SignalGenerator:
         """
         Estrategia Momentum Burst.
         Opera em movimentos fortes de preço com volume.
+
+        MELHORIA B1: Filtros mais estritos para SHORT para evitar short squeezes.
         """
         # Usar .values[-1] para performance
         price = df['close'].values[-1]
@@ -481,6 +893,8 @@ class SignalGenerator:
         atr = df['atr'].values[-1]
         adx = df['adx'].values[-1]
         rsi = df['rsi'].values[-1]
+        ema_f = df['ema_fast'].values[-1]
+        ema_s = df['ema_slow'].values[-1]
 
         if np.isnan(atr) or atr == 0:
             return Signal('none', 0, price, 0, 0, 'Indicadores invalidos')
@@ -493,25 +907,39 @@ class SignalGenerator:
         price_change = price - prev_close
         price_move = abs(price_change) / atr
 
+        # Confirmações de tendência
+        ema_bullish = ema_f > ema_s
+        ema_bearish = ema_f < ema_s
+
         # Tendência forte com movimento
-        # CORRIGIDO: Usar params ao invés de hardcoded 30 e 1.0
         if adx > self.momentum_adx_threshold and price_move > self.momentum_min_move:
-            # CORRIGIDO: RSI thresholds agora configuráveis
-            rsi_center = 50  # Centro do RSI
-            rsi_range = 20   # Distância do centro
-            if price_change > 0 and rsi > rsi_center and rsi < (rsi_center + rsi_range):
+            # LONG: RSI 45-65 + movimento up + EMA bullish (opcional)
+            if price_change > 0 and rsi > 45 and rsi < 65:
                 direction = 'long'
                 strength = min(10, 5 + price_move + adx / 20)
+                # Bonus se EMA confirma
+                if ema_bullish:
+                    strength = min(10, strength + 0.5)
                 reason = f'Momentum up (ADX={adx:.1f}, move={price_move:.1f}x ATR)'
-            elif price_change < 0 and rsi < rsi_center and rsi > (rsi_center - rsi_range):
-                direction = 'short'
-                strength = min(10, 5 + price_move + adx / 20)
-                reason = f'Momentum down (ADX={adx:.1f}, move={price_move:.1f}x ATR)'
 
-        # Calcular SL/TP usando parametros (CORRIGIDO: removido hardcoded)
+            # MELHORIA B1: SHORT com filtros mais estritos
+            # RSI 35-55 (evita short squeezes) + movimento down + EMA bearish OBRIGATÓRIO
+            elif price_change < 0 and rsi > 35 and rsi < 55:
+                # OBRIGATÓRIO: EMA deve confirmar tendência bearish
+                if ema_bearish:
+                    direction = 'short'
+                    strength = min(10, 5 + price_move + adx / 20)
+                    reason = f'Momentum down (ADX={adx:.1f}, move={price_move:.1f}x ATR, EMA bear)'
+                # Se EMA não confirma, reduzir muito a força ou não entrar
+                elif adx > 35:  # Só permitir SHORT sem EMA se ADX muito forte
+                    direction = 'short'
+                    strength = min(7, 4 + price_move)  # Força reduzida
+                    reason = f'Momentum down (ADX={adx:.1f}, move={price_move:.1f}x ATR, weak)'
+
+        # Calcular SL/TP usando parametros
         # Momentum usa SL mais apertado (75% do normal) e TP normal
-        momentum_sl_mult = self.sl_atr_mult * 0.75  # SL mais apertado para momentum
-        momentum_tp_mult = self.tp_atr_mult * 0.85  # TP ligeiramente menor
+        momentum_sl_mult = self.sl_atr_mult * 0.75
+        momentum_tp_mult = self.tp_atr_mult * 0.85
         if direction == 'long':
             sl = price - (atr * momentum_sl_mult)
             tp = price + (atr * momentum_tp_mult)
@@ -569,16 +997,21 @@ class SignalGenerator:
         """
         Estrategia Mean Reversion com Bollinger Bands.
 
-        ATUALIZADO V1.1:
-        - SHORT BB upper bounce DESABILITADO (0% WR em produção)
-        - Long bias aplicado ao strength
-        - RSI thresholds menos extremos (35 vs 30)
+        ATUALIZADO V1.3 (Melhoria B3):
+        - SHORT BB upper bounce com confirmações ainda mais estritas
+        - Requer: candle anterior tocou BB upper + candle atual fechou ABAIXO
+        - RSI > 70 (extremo)
+        - ADX < 20 (confirma mercado lateral)
+        - Candle bearish (price < prev_close)
         """
         # Usar .values[-1] para performance
         price = df['close'].values[-1]
+        prev_close = df['close'].values[-2]
+        prev_high = df['high'].values[-2]
         atr = df['atr'].values[-1]
         rsi = df['rsi'].values[-1]
         bb_upper = df['bb_upper'].values[-1]
+        bb_upper_prev = df['bb_upper'].values[-2]
         bb_lower = df['bb_lower'].values[-1]
         adx = df['adx'].values[-1]
 
@@ -589,8 +1022,11 @@ class SignalGenerator:
         strength = 0
         reason = ''
 
-        # Apenas em mercado lateral (ADX baixo)
-        mr_adx_max = self.params.get('mr_adx_max', 22)  # Era 25
+        # Verificar se shorts de MR estão habilitados
+        mr_short_enabled = self.params.get('mr_short_enabled', True)
+
+        # MELHORIA B3: Apenas em mercado lateral (ADX < mr_adx_max)
+        mr_adx_max = self.params.get('mr_adx_max', 22)
         if adx < mr_adx_max:
             # Bounce no BB inferior - LONG permitido
             if price < bb_lower and rsi < 35:
@@ -600,16 +1036,30 @@ class SignalGenerator:
                 strength = min(9, (6 + rsi_bonus) * self.long_bias)
                 reason = f'BB lower bounce (RSI={rsi:.1f}, ADX={adx:.0f})'
 
-            # Bounce no BB superior - SHORT DESABILITADO
-            # Análise de trades reais mostrou 0% WR para esta condição
-            # elif price > bb_upper and rsi > 65:
-            #     direction = 'short'
-            #     strength = 6 * self.short_penalty
-            #     reason = f'BB upper bounce (RSI={rsi:.1f})'
+            # MELHORIA B3: Bounce no BB superior - SHORT com confirmações extras
+            # Condições:
+            # 1. Candle anterior tocou/excedeu BB upper (prev_high > bb_upper_prev)
+            # 2. Candle atual fechou ABAIXO do BB upper (reversão confirmada)
+            # 3. RSI > 70 (extremo)
+            # 4. Candle bearish (price < prev_close)
+            elif mr_short_enabled and rsi > 70:
+                # Confirmar que candle anterior tocou BB upper
+                prev_touched_upper = prev_high > bb_upper_prev or prev_close > bb_upper_prev
+                # Confirmar que candle atual fechou ABAIXO do BB upper (reversão)
+                current_below_upper = price < bb_upper
+                # Confirmar candle bearish
+                bearish_candle = price < prev_close
+
+                if prev_touched_upper and current_below_upper and bearish_candle:
+                    direction = 'short'
+                    # Strength dinâmico baseado em quão extremo está
+                    rsi_bonus = min(1.5, (rsi - 70) / 15)
+                    strength = min(9, (6 + rsi_bonus) * self.short_penalty)
+                    reason = f'BB upper reversal (RSI={rsi:.1f}, ADX={adx:.0f}, confirmed)'
 
         # Mean reversion usa SL mais apertado (60% do normal) e TP conservador (70%)
-        mr_sl_mult = self.sl_atr_mult * 0.60  # Aumentado de 0.50
-        mr_tp_mult = self.tp_atr_mult * 0.70  # Aumentado de 0.60
+        mr_sl_mult = self.sl_atr_mult * 0.60
+        mr_tp_mult = self.tp_atr_mult * 0.70
         if direction == 'long':
             sl = price - (atr * mr_sl_mult)
             tp = price + (atr * mr_tp_mult)
@@ -636,14 +1086,18 @@ def check_exit_signal(
 ) -> Optional[str]:
     """
     Verificar sinais de saida.
-    
+
     Returns:
         Razao da saida ou None se deve manter
     """
-    side = position['side']
-    entry = position['entry']
-    sl = position['sl']
-    tp = position['tp']
+    # CORRIGIDO (Bug #14): Validar keys com .get() para evitar KeyError
+    side = position.get('side')
+    entry = position.get('entry', 0)
+    sl = position.get('sl', 0)
+    tp = position.get('tp', 0)
+
+    if not side or entry <= 0:
+        return None
     
     if side == 'long':
         # Só verificar SL/TP se estiverem definidos (> 0)

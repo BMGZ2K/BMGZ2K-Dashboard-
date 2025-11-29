@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Trading Dashboard</title>
+    <!-- Plotly.js CDN -->
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -558,6 +560,112 @@
         @keyframes spin {
             to { transform: rotate(360deg); }
         }
+
+        /* Chart containers */
+        .charts-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+            margin-bottom: 24px;
+        }
+
+        .chart-container {
+            background: #151b28;
+            border-radius: 12px;
+            padding: 20px 24px;
+            border: 1px solid #2d3748;
+            min-height: 400px;
+            overflow: hidden;
+        }
+
+        .chart-container.full-width {
+            grid-column: 1 / -1;
+        }
+
+        .chart-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: #9ca3af;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .chart-stats {
+            display: flex;
+            gap: 20px;
+            font-size: 12px;
+        }
+
+        .chart-stat {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .chart-stat-value {
+            font-size: 16px;
+            font-weight: 600;
+            color: #fff;
+        }
+
+        .chart-stat-label {
+            font-size: 10px;
+            color: #6b7280;
+        }
+
+        .chart-placeholder {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 280px;
+            color: #6b7280;
+            font-size: 14px;
+        }
+
+        @media (max-width: 1200px) {
+            .charts-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Collapsible sections */
+        .collapsible-header {
+            cursor: pointer;
+            user-select: none;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .collapsible-header:hover {
+            opacity: 0.8;
+        }
+
+        .collapse-icon {
+            font-size: 12px;
+            transition: transform 0.3s ease;
+            color: #6b7280;
+        }
+
+        .collapsible-header.collapsed .collapse-icon {
+            transform: rotate(-90deg);
+        }
+
+        .collapsible-content {
+            overflow: hidden;
+            transition: max-height 0.3s ease, opacity 0.3s ease;
+            max-height: 2000px;
+            opacity: 1;
+        }
+
+        .collapsible-content.collapsed {
+            max-height: 0;
+            opacity: 0;
+        }
     </style>
 </head>
 <body>
@@ -695,11 +803,88 @@
                         <span style="color: #9ca3af;">Estrategia:</span>
                         <span id="active-strategy" style="color: #a855f7;">--</span>
                     </div>
+                    <div style="display: flex; justify-content: space-between;">
+                        <span style="color: #9ca3af;">Kelly Sizing:</span>
+                        <span id="kelly-status" style="color: #10b981;">--</span>
+                    </div>
                 </div>
             </div>
         </div>
-        
-        <!-- Posicoes Abertas -->
+
+        <!-- Status do Bot e Sinais MTF -->
+        <div class="section">
+            <h2 class="section-title">Status do Bot & Sinais MTF</h2>
+            <div class="grid" style="grid-template-columns: 1fr 2fr;">
+                <!-- Status do Bot -->
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Bot Status</span>
+                        <div id="bot-status-indicator" class="live-indicator" style="background: #6b7280;"></div>
+                    </div>
+                    <div id="bot-status-content">
+                        <div style="margin-bottom: 15px;">
+                            <span id="bot-running-badge" class="status-badge" style="background: #6b728020; color: #6b7280;">OFFLINE</span>
+                        </div>
+                        <div style="font-size: 13px; color: #9ca3af;">
+                            <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                                <span>PID:</span>
+                                <span id="bot-pid" style="color: #fff;">--</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                                <span>Uptime:</span>
+                                <span id="bot-uptime" style="color: #fff;">--</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                                <span>Mode:</span>
+                                <span id="bot-mode" style="color: #f59e0b;">--</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                                <span>Timeframes:</span>
+                                <span id="bot-timeframes" style="color: #3b82f6;">--</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between;">
+                                <span>Symbols:</span>
+                                <span id="bot-symbols-count" style="color: #10b981;">--</span>
+                            </div>
+                        </div>
+                        <div style="margin-top: 15px; padding-top: 10px; border-top: 1px solid #2d3748;">
+                            <div style="font-size: 11px; color: #6b7280; margin-bottom: 5px;">Ultimo escaneamento:</div>
+                            <div id="bot-scanning" style="font-size: 12px; color: #a855f7; word-wrap: break-word;">--</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Sinais MTF em Tempo Real -->
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Sinais MTF em Tempo Real</span>
+                        <div style="display: flex; gap: 10px; align-items: center;">
+                            <span id="signals-count" style="font-size: 12px; color: #3b82f6;">0 sinais</span>
+                            <span id="signals-update" style="font-size: 11px; color: #6b7280;">--</span>
+                        </div>
+                    </div>
+                    <div id="mtf-stats" style="display: flex; gap: 15px; margin-bottom: 15px;">
+                        <div style="background: #1a2234; padding: 8px 15px; border-radius: 8px; text-align: center;">
+                            <div style="font-size: 18px; font-weight: 600; color: #10b981;" id="stats-5m">0</div>
+                            <div style="font-size: 10px; color: #6b7280;">5m</div>
+                        </div>
+                        <div style="background: #1a2234; padding: 8px 15px; border-radius: 8px; text-align: center;">
+                            <div style="font-size: 18px; font-weight: 600; color: #3b82f6;" id="stats-15m">0</div>
+                            <div style="font-size: 10px; color: #6b7280;">15m</div>
+                        </div>
+                        <div style="background: #1a2234; padding: 8px 15px; border-radius: 8px; text-align: center;">
+                            <div style="font-size: 18px; font-weight: 600; color: #f59e0b;" id="stats-1h">0</div>
+                            <div style="font-size: 10px; color: #6b7280;">1h</div>
+                        </div>
+                    </div>
+                    <div id="signals-container" style="max-height: 200px; overflow-y: auto;">
+                        <div class="no-data">Aguardando sinais do bot...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Posicoes Abertas (PRIMEIRO) -->
         <div class="section">
             <h2 class="section-title">Posicoes Abertas <span id="total-unrealized-pnl" style="font-size: 14px; margin-left: 15px;"></span></h2>
             <div class="card">
@@ -724,6 +909,90 @@
                         <tr><td colspan="12" class="no-data">Nenhuma posicao aberta</td></tr>
                     </tbody>
                 </table>
+            </div>
+        </div>
+
+        <!-- Graficos de Performance (RETRATIL) -->
+        <div class="section">
+            <h2 class="section-title collapsible-header collapsed" onclick="toggleSection('charts-section', this)">
+                <span class="collapse-icon">&#9660;</span>
+                Performance Visual
+                <span style="font-size: 12px; color: #6b7280; margin-left: 10px;">(clique para expandir)</span>
+            </h2>
+            <div id="charts-section" class="collapsible-content collapsed">
+                <div class="charts-grid">
+                    <!-- Equity Curve -->
+                    <div class="chart-container full-width">
+                        <div class="chart-title">
+                            <span>Equity Curve</span>
+                            <div class="chart-stats" id="equity-stats">
+                                <div class="chart-stat">
+                                    <span class="chart-stat-value" id="equity-return">--</span>
+                                    <span class="chart-stat-label">Retorno Total</span>
+                                </div>
+                                <div class="chart-stat">
+                                    <span class="chart-stat-value" id="equity-hwm">--</span>
+                                    <span class="chart-stat-label">High Water Mark</span>
+                                </div>
+                                <div class="chart-stat">
+                                    <span class="chart-stat-value" id="equity-trades">--</span>
+                                    <span class="chart-stat-label">Total Trades</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div id="equity-chart" class="chart-placeholder">Carregando...</div>
+                    </div>
+
+                    <!-- Drawdown -->
+                    <div class="chart-container">
+                        <div class="chart-title">
+                            <span>Drawdown</span>
+                            <div class="chart-stats">
+                                <div class="chart-stat">
+                                    <span class="chart-stat-value" id="max-drawdown-chart" style="color: #ef4444;">--</span>
+                                    <span class="chart-stat-label">Max DD</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div id="drawdown-chart" class="chart-placeholder">Carregando...</div>
+                    </div>
+
+                    <!-- Wins vs Losses -->
+                    <div class="chart-container">
+                        <div class="chart-title">
+                            <span>Wins vs Losses</span>
+                            <div class="chart-stats">
+                                <div class="chart-stat">
+                                    <span class="chart-stat-value" id="pnl-mean" style="color: #10b981;">--</span>
+                                    <span class="chart-stat-label">Media Win</span>
+                                </div>
+                                <div class="chart-stat">
+                                    <span class="chart-stat-value" id="pnl-median" style="color: #ef4444;">--</span>
+                                    <span class="chart-stat-label">Media Loss</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div id="pnl-histogram" class="chart-placeholder">Carregando...</div>
+                    </div>
+
+                    <!-- PnL by Symbol -->
+                    <div class="chart-container full-width">
+                        <div class="chart-title">
+                            <span>PnL por Simbolo</span>
+                            <div class="chart-stats">
+                                <div class="chart-stat">
+                                    <span class="chart-stat-value" id="best-symbol">--</span>
+                                    <span class="chart-stat-label">Melhor</span>
+                                </div>
+                                <div class="chart-stat">
+                                    <span class="chart-stat-value" id="worst-symbol">--</span>
+                                    <span class="chart-stat-label">Pior</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div id="symbol-chart" class="chart-placeholder">Carregando...</div>
+                    </div>
+                </div>
             </div>
         </div>
         
@@ -824,11 +1093,15 @@
         }
 
         // ===== FUNÇÕES DE FORMATAÇÃO =====
-        function formatCurrency(value) {
+        function formatCurrency(value, decimals = 2) {
+            // Evitar -$0.00 para valores muito pequenos
+            const threshold = Math.pow(10, -(decimals + 1)) * 5;
+            if (Math.abs(value) < threshold) value = 0;
             return new Intl.NumberFormat('en-US', {
                 style: 'currency',
                 currency: 'USD',
-                minimumFractionDigits: 2
+                minimumFractionDigits: decimals,
+                maximumFractionDigits: decimals
             }).format(value);
         }
 
@@ -1097,6 +1370,16 @@
             
             // Posicoes
             document.getElementById('positions-count').textContent = data.open_positions || 0;
+
+            // Kelly Sizing status
+            const kellyEl = document.getElementById('kelly-status');
+            if (data.use_kelly) {
+                kellyEl.textContent = 'ON';
+                kellyEl.style.color = '#10b981';
+            } else {
+                kellyEl.textContent = 'OFF';
+                kellyEl.style.color = '#6b7280';
+            }
         }
         
         async function updatePositions() {
@@ -1144,21 +1427,21 @@
                         <td>${formatPrice(p.current_price)}</td>
                         <td>$${p.notional.toLocaleString()}</td>
                         <td style="color: ${pnlColor}; font-weight: 600;">
-                            ${formatCurrency(p.unrealized_pnl)}<br>
-                            <span style="font-size: 10px;">${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct}%</span>
+                            ${formatCurrency(p.unrealized_pnl, 3)}<br>
+                            <span style="font-size: 10px;">${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(3)}%</span>
                         </td>
                         <td style="color: #ef4444;">
-                            ${formatPrice(p.stop_loss)}<br>
-                            <span style="font-size: 10px;">${p.sl_distance}%</span>
+                            ${p.stop_loss > 0 ? formatPrice(p.stop_loss) : '-'}<br>
+                            <span style="font-size: 10px;">${p.stop_loss > 0 ? p.sl_distance + '%' : '-'}</span>
                         </td>
                         <td style="color: #10b981;">
-                            ${formatPrice(p.take_profit)}<br>
-                            <span style="font-size: 10px;">${p.tp_distance}%</span>
+                            ${p.take_profit > 0 ? formatPrice(p.take_profit) : '-'}<br>
+                            <span style="font-size: 10px;">${p.take_profit > 0 ? p.tp_distance + '%' : '-'}</span>
                         </td>
                         <td style="color: #f59e0b; font-size: 11px;">
                             ${p.liquidation_price > 0 ? formatPrice(p.liquidation_price) : '-'}
                         </td>
-                        <td style="font-size: 10px; max-width: 100px; overflow: hidden; text-overflow: ellipsis;" title="${p.reason_entry}">
+                        <td style="font-size: 10px; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${p.reason_entry || ''}">
                             ${p.reason_entry || '-'}
                         </td>
                     </tr>
@@ -1552,6 +1835,87 @@
             await updateUnified();
             await updateMedium();
             await updateSlow();
+            await updateBotStatus();
+            await updateSignals();
+        }
+
+        // ===== BOT STATUS E SINAIS MTF =====
+        async function updateBotStatus() {
+            const data = await fetchData('/api/bot-status');
+            if (!data) return;
+
+            // Indicador de status
+            const indicator = document.getElementById('bot-status-indicator');
+            const badge = document.getElementById('bot-running-badge');
+
+            if (data.running) {
+                indicator.style.background = '#10b981';
+                badge.textContent = 'ONLINE';
+                badge.style.background = '#10b98120';
+                badge.style.color = '#10b981';
+            } else {
+                indicator.style.background = '#ef4444';
+                badge.textContent = 'OFFLINE';
+                badge.style.background = '#ef444420';
+                badge.style.color = '#ef4444';
+            }
+
+            // Detalhes
+            document.getElementById('bot-pid').textContent = data.pid || '--';
+            document.getElementById('bot-uptime').textContent = data.uptime_formatted || '--';
+            document.getElementById('bot-mode').textContent = data.mode || '--';
+            document.getElementById('bot-timeframes').textContent = (data.active_timeframes || []).join(', ') || '--';
+            document.getElementById('bot-symbols-count').textContent = data.symbols_count || '--';
+
+            // Simbolos escaneados
+            const scanning = data.scanning_symbols || [];
+            document.getElementById('bot-scanning').textContent = scanning.length > 0
+                ? scanning.join(', ')
+                : 'Nenhum sinal recente';
+        }
+
+        async function updateSignals() {
+            const data = await fetchData('/api/signals');
+            if (!data) return;
+
+            // Contador e ultima atualizacao
+            document.getElementById('signals-count').textContent = `${data.total_signals || 0} sinais`;
+            if (data.last_update) {
+                const updateTime = new Date(data.last_update).toLocaleTimeString('pt-BR');
+                document.getElementById('signals-update').textContent = updateTime;
+            }
+
+            // Stats por timeframe
+            const stats = data.mtf_stats || {};
+            document.getElementById('stats-5m').textContent = stats['5m'] || 0;
+            document.getElementById('stats-15m').textContent = stats['15m'] || 0;
+            document.getElementById('stats-1h').textContent = stats['1h'] || 0;
+
+            // Sinais
+            const container = document.getElementById('signals-container');
+            const signals = data.signals || [];
+
+            if (signals.length === 0) {
+                container.innerHTML = '<div class="no-data">Nenhum sinal ativo no momento</div>';
+                return;
+            }
+
+            container.innerHTML = signals.map(s => {
+                const sideColor = s.side.toLowerCase() === 'buy' ? '#10b981' : '#ef4444';
+                const sideIcon = s.side.toLowerCase() === 'buy' ? '[+]' : '[-]';
+                const tfColor = {'5m': '#10b981', '15m': '#3b82f6', '1h': '#f59e0b'}[s.timeframe] || '#9ca3af';
+
+                return `
+                    <div style="display: flex; align-items: center; gap: 10px; padding: 8px; background: #1a2234; border-radius: 6px; margin-bottom: 6px;">
+                        <span style="color: ${sideColor}; font-weight: 600; font-size: 13px;">${sideIcon}</span>
+                        <span style="font-weight: 600; color: #fff; min-width: 80px;">${s.symbol}</span>
+                        <span style="background: ${tfColor}20; color: ${tfColor}; padding: 2px 8px; border-radius: 10px; font-size: 11px;">${s.timeframe}</span>
+                        <span style="color: #a855f7; font-size: 12px;">Str: ${s.strength}</span>
+                        ${s.aligned_count > 0 ? `<span style="color: #3b82f6; font-size: 11px;">${s.aligned_count} TF aligned</span>` : ''}
+                        <span style="margin-left: auto; color: #6b7280; font-size: 11px;">${formatPrice(s.price)}</span>
+                    </div>
+                `;
+            }).join('');
         }
 
         // ===== INICIAR ATUALIZAÇÕES =====
@@ -1565,6 +1929,8 @@
         setInterval(updateUnified, UNIFIED_INTERVAL);  // 1s - TUDO sincronizado
         setInterval(updateMedium, TRADES_INTERVAL);    // 3s - trades
         setInterval(updateSlow, SLOW_INTERVAL);        // 10s - estratégias e logs
+        setInterval(updateBotStatus, TRADES_INTERVAL); // 3s - status do bot
+        setInterval(updateSignals, TRADES_INTERVAL);   // 3s - sinais MTF
 
         // Verificar dados desatualizados a cada 2s
         setInterval(checkDataStaleness, 2000);
@@ -1578,6 +1944,327 @@
                 }
             }
         });
+
+        // ===== COLLAPSIBLE SECTIONS =====
+        let chartsLoaded = false;
+
+        function toggleSection(sectionId, headerElement) {
+            const content = document.getElementById(sectionId);
+            const isCollapsed = content.classList.contains('collapsed');
+
+            if (isCollapsed) {
+                // Expandir
+                content.classList.remove('collapsed');
+                headerElement.classList.remove('collapsed');
+                headerElement.querySelector('span:last-child').textContent = '(clique para retrair)';
+
+                // Carregar graficos apenas quando expandir pela primeira vez
+                if (!chartsLoaded) {
+                    chartsLoaded = true;
+                    setTimeout(updateCharts, 100);
+                }
+            } else {
+                // Retrair
+                content.classList.add('collapsed');
+                headerElement.classList.add('collapsed');
+                headerElement.querySelector('span:last-child').textContent = '(clique para expandir)';
+            }
+        }
+
+        // ===== PLOTLY CHART CONFIGURATION =====
+        const plotlyDarkLayout = {
+            paper_bgcolor: '#151b28',
+            plot_bgcolor: '#151b28',
+            font: { color: '#9ca3af', family: 'Segoe UI, sans-serif' },
+            margin: { l: 50, r: 30, t: 30, b: 50 },
+            xaxis: {
+                gridcolor: '#2d3748',
+                linecolor: '#2d3748',
+                zerolinecolor: '#2d3748'
+            },
+            yaxis: {
+                gridcolor: '#2d3748',
+                linecolor: '#2d3748',
+                zerolinecolor: '#2d3748'
+            },
+            showlegend: false
+        };
+
+        const plotlyConfig = {
+            displayModeBar: false,
+            responsive: true
+        };
+
+        // ===== CHART FUNCTIONS =====
+
+        // Equity Curve + High Water Mark
+        async function updateEquityChart() {
+            const data = await fetchData('/api/equity-history');
+            if (!data || data.error || !data.equity_curve || data.equity_curve.length < 2) {
+                document.getElementById('equity-chart').innerHTML = '<div class="chart-placeholder">Sem dados de equity</div>';
+                return;
+            }
+
+            // Update stats
+            const returnPct = data.total_return_pct || 0;
+            document.getElementById('equity-return').textContent = formatPercent(returnPct);
+            document.getElementById('equity-return').style.color = returnPct >= 0 ? '#10b981' : '#ef4444';
+            document.getElementById('equity-hwm').textContent = formatCurrency(data.high_water_mark || 0);
+            document.getElementById('equity-trades').textContent = data.total_trades || 0;
+
+            const curve = data.equity_curve;
+            const timestamps = curve.map(p => new Date(p.timestamp));
+            const equities = curve.map(p => p.equity);
+
+            // Calculate HWM line
+            let hwmLine = [];
+            let currentHwm = equities[0] || 0;
+            for (let e of equities) {
+                currentHwm = Math.max(currentHwm, e);
+                hwmLine.push(currentHwm);
+            }
+
+            const traces = [
+                {
+                    x: timestamps,
+                    y: equities,
+                    type: 'scatter',
+                    mode: 'lines',
+                    name: 'Equity',
+                    line: { color: '#3b82f6', width: 2 },
+                    fill: 'tozeroy',
+                    fillcolor: 'rgba(59, 130, 246, 0.1)'
+                },
+                {
+                    x: timestamps,
+                    y: hwmLine,
+                    type: 'scatter',
+                    mode: 'lines',
+                    name: 'HWM',
+                    line: { color: '#10b981', width: 1, dash: 'dot' }
+                }
+            ];
+
+            const layout = {
+                ...plotlyDarkLayout,
+                showlegend: true,
+                legend: { orientation: 'h', y: -0.2, font: { color: '#9ca3af' } },
+                yaxis: { ...plotlyDarkLayout.yaxis, tickprefix: '$', automargin: true },
+                xaxis: { ...plotlyDarkLayout.xaxis, automargin: true },
+                margin: { l: 70, r: 30, t: 20, b: 70 },
+                height: 320
+            };
+
+            // Limpar container e remover classe placeholder antes de renderizar
+            const container = document.getElementById('equity-chart');
+            container.innerHTML = '';
+            container.classList.remove('chart-placeholder');
+            Plotly.newPlot(container, traces, layout, plotlyConfig);
+        }
+
+        // Drawdown Chart
+        async function updateDrawdownChart() {
+            const data = await fetchData('/api/equity-history');
+            if (!data || data.error || !data.equity_curve || data.equity_curve.length < 2) {
+                document.getElementById('drawdown-chart').innerHTML = '<div class="chart-placeholder">Sem dados de drawdown</div>';
+                return;
+            }
+
+            document.getElementById('max-drawdown-chart').textContent = `-${(data.max_drawdown || 0).toFixed(2)}%`;
+
+            const curve = data.equity_curve;
+            const timestamps = curve.map(p => new Date(p.timestamp));
+            const drawdowns = curve.map(p => -p.drawdown);  // Negative for visual
+
+            const trace = {
+                x: timestamps,
+                y: drawdowns,
+                type: 'scatter',
+                mode: 'lines',
+                fill: 'tozeroy',
+                fillcolor: 'rgba(239, 68, 68, 0.3)',
+                line: { color: '#ef4444', width: 1 }
+            };
+
+            const layout = {
+                ...plotlyDarkLayout,
+                yaxis: { ...plotlyDarkLayout.yaxis, ticksuffix: '%', automargin: true },
+                xaxis: { ...plotlyDarkLayout.xaxis, automargin: true },
+                margin: { l: 60, r: 30, t: 20, b: 60 },
+                height: 300
+            };
+
+            // Limpar container e remover classe placeholder antes de renderizar
+            const container = document.getElementById('drawdown-chart');
+            container.innerHTML = '';
+            container.classList.remove('chart-placeholder');
+            Plotly.newPlot(container, [trace], layout, plotlyConfig);
+        }
+
+        // Wins vs Losses - Barras verticais simples
+        async function updatePnLHistogram() {
+            const data = await fetchData('/api/pnl-distribution');
+            if (!data || data.error || !data.pnls || data.pnls.length === 0) {
+                document.getElementById('pnl-histogram').innerHTML = '<div class="chart-placeholder">Sem dados de PnL</div>';
+                return;
+            }
+
+            const pnls = data.pnls;
+            const wins = pnls.filter(p => p >= 0);
+            const losses = pnls.filter(p => p < 0);
+
+            const avgWin = wins.length > 0 ? wins.reduce((a, b) => a + b, 0) / wins.length : 0;
+            const avgLoss = losses.length > 0 ? Math.abs(losses.reduce((a, b) => a + b, 0) / losses.length) : 0;
+            const totalWin = wins.reduce((a, b) => a + b, 0);
+            const totalLoss = Math.abs(losses.reduce((a, b) => a + b, 0));
+
+            // Update stats no header
+            document.getElementById('pnl-mean').textContent = formatCurrency(avgWin);
+            document.getElementById('pnl-median').textContent = formatCurrency(-avgLoss);
+
+            // Barras verticais: Wins (verde, positivo) e Losses (vermelho, negativo)
+            const trace = {
+                x: ['Wins', 'Losses'],
+                y: [totalWin, -totalLoss],
+                type: 'bar',
+                marker: {
+                    color: ['#10b981', '#ef4444']
+                },
+                text: [
+                    formatCurrency(totalWin),
+                    formatCurrency(-totalLoss)
+                ],
+                textposition: 'inside',
+                textfont: { color: '#ffffff', size: 14, family: 'Segoe UI, sans-serif' },
+                insidetextanchor: 'middle',
+                hovertemplate: '<b>%{x}</b><br>%{customdata} trades<br>%{text}<extra></extra>',
+                customdata: [wins.length, losses.length]
+            };
+
+            // Calcular range do eixo Y com margem para mostrar valores
+            const maxVal = Math.max(totalWin, totalLoss);
+            const yRange = [-maxVal * 1.15, maxVal * 1.15];
+
+            const layout = {
+                ...plotlyDarkLayout,
+                xaxis: { ...plotlyDarkLayout.xaxis, type: 'category', automargin: true },
+                yaxis: {
+                    ...plotlyDarkLayout.yaxis,
+                    tickprefix: '$',
+                    zeroline: true,
+                    zerolinecolor: '#6b7280',
+                    zerolinewidth: 1,
+                    automargin: true,
+                    range: yRange
+                },
+                height: 300,
+                bargap: 0.3,
+                margin: { l: 70, r: 30, t: 30, b: 50 },
+                annotations: [
+                    {
+                        x: 'Wins',
+                        y: totalWin,
+                        text: wins.length + ' trades',
+                        showarrow: false,
+                        yshift: 15,
+                        font: { color: '#10b981', size: 11 }
+                    },
+                    {
+                        x: 'Losses',
+                        y: -totalLoss,
+                        text: losses.length + ' trades',
+                        showarrow: false,
+                        yshift: -15,
+                        font: { color: '#ef4444', size: 11 }
+                    }
+                ]
+            };
+
+            const container = document.getElementById('pnl-histogram');
+            container.innerHTML = '';
+            container.classList.remove('chart-placeholder');
+            Plotly.newPlot(container, [trace], layout, plotlyConfig);
+        }
+
+        // PnL by Symbol Chart
+        async function updateSymbolChart() {
+            const data = await fetchData('/api/pnl-by-symbol');
+            if (!data || data.error || !data.symbols || data.symbols.length === 0) {
+                document.getElementById('symbol-chart').innerHTML = '<div class="chart-placeholder">Sem dados por simbolo</div>';
+                return;
+            }
+
+            // Update stats
+            if (data.best_symbol) {
+                const bestEl = document.getElementById('best-symbol');
+                bestEl.textContent = `${data.best_symbol.symbol} (${formatCurrency(data.best_symbol.total_pnl)})`;
+                bestEl.style.color = '#10b981';
+            }
+            if (data.worst_symbol) {
+                const worstEl = document.getElementById('worst-symbol');
+                worstEl.textContent = `${data.worst_symbol.symbol} (${formatCurrency(data.worst_symbol.total_pnl)})`;
+                worstEl.style.color = '#ef4444';
+            }
+
+            const symbols = data.symbols;
+            const sortedSymbols = [...symbols].sort((a, b) => b.total_pnl - a.total_pnl);
+
+            const trace = {
+                x: sortedSymbols.map(s => s.symbol.replace('/USDT', '')),
+                y: sortedSymbols.map(s => s.total_pnl),
+                type: 'bar',
+                marker: {
+                    color: sortedSymbols.map(s => s.total_pnl >= 0 ? '#10b981' : '#ef4444'),
+                    line: { color: '#151b28', width: 1 }
+                },
+                text: sortedSymbols.map(s => `${s.trades} trades | ${s.win_rate}% WR`),
+                textposition: 'none',
+                hovertemplate: '<b>%{x}</b><br>PnL: $%{y:.2f}<br>%{text}<extra></extra>'
+            };
+
+            const layout = {
+                ...plotlyDarkLayout,
+                yaxis: { ...plotlyDarkLayout.yaxis, tickprefix: '$', title: 'PnL Total', automargin: true },
+                xaxis: { ...plotlyDarkLayout.xaxis, tickangle: -45, type: 'category', automargin: true },
+                margin: { l: 70, r: 30, t: 30, b: 80 },
+                bargap: 0.3,
+                height: 320,
+                shapes: [{
+                    type: 'line',
+                    x0: -0.5, x1: sortedSymbols.length - 0.5,
+                    y0: 0, y1: 0,
+                    line: { color: '#6b7280', width: 1, dash: 'dash' }
+                }]
+            };
+
+            // Limpar container e remover classe placeholder antes de renderizar
+            const container = document.getElementById('symbol-chart');
+            container.innerHTML = '';
+            container.classList.remove('chart-placeholder');
+            Plotly.newPlot(container, [trace], layout, plotlyConfig);
+        }
+
+        // Update all charts
+        async function updateCharts() {
+            try {
+                await Promise.all([
+                    updateEquityChart(),
+                    updateDrawdownChart(),
+                    updatePnLHistogram(),
+                    updateSymbolChart()
+                ]);
+            } catch (e) {
+                console.error('Erro ao atualizar graficos:', e);
+            }
+        }
+
+        // Charts only load when user expands the section (chartsLoaded flag)
+        // Update charts every 10 seconds IF expanded
+        setInterval(() => {
+            if (chartsLoaded) {
+                updateCharts();
+            }
+        }, SLOW_INTERVAL);
     </script>
 </body>
 </html>
